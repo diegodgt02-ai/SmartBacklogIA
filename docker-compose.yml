@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: spb
+      POSTGRES_PASSWORD: spb
+      POSTGRES_DB: spb
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spb -d spb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://spb:spb@db:5432/spb
+      AGENT_DOCS_DIR: /data/documents
+    volumes:
+      # Documentos por proyecto (documents/<KEY>/), solo lectura para la app
+      - ./documents:/data/documents:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}{{ project.key }} · Reportes{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Reportes</h1>
+    <p class="muted">Resumen del backlog y exportación para Jira, Trello u hojas de cálculo.</p>
+  </div>
+  <span class="spacer"></span>
+  <a class="btn" href="/api/v1/projects/{{ project.key }}/export?format=csv">Exportar CSV</a>
+  <a class="btn btn-primary" href="/api/v1/projects/{{ project.key }}/export?format=json">Exportar JSON</a>
+</div>
+
+<div class="grid grid-4" style="margin-bottom:16px">
+  <div class="card kpi"><div class="label">Total HU</div><div class="value">{{ summary.total_stories }}</div></div>
+  <div class="card kpi"><div class="label">Puntos activos</div><div class="value">{{ '%g'|format(summary.total_points) }}</div></div>
+  <div class="card kpi"><div class="label">Completado</div><div class="value">{{ summary.completion_pct }}%</div></div>
+  <div class="card kpi"><div class="label">HU-IA</div><div class="value">{{ summary.by_type.get('HU_IA', {'count': 0}).count }}</div>
+    <div class="small muted">Tradicionales: {{ summary.by_type.get('HU_TRADICIONAL', {'count': 0}).count }}</div></div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom:16px">
+  <section class="card">
+    <div class="card-head"><h2>Por estado</h2></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Estado</th><th class="num">HU</th><th class="num">Pts</th></tr></thead>
+      <tbody>
+      {% for code, v in summary.by_status.items() %}
+        <tr><td><span class="badge st-{{ code }}">{{ v.label }}</span></td><td class="num">{{ v.count }}</td><td class="num">{{ '%g'|format(v.points) }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Por asignado</h2></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Persona</th><th class="num">HU</th><th class="num">Pts</th></tr></thead>
+      <tbody>
+      {% for name, v in summary.by_assignee.items() %}
+        <tr><td>{{ name }}</td><td class="num">{{ v.count }}</td><td class="num">{{ '%g'|format(v.points) }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+</div>
+
+<section class="card" style="margin-bottom:16px">
+  <div class="card-head"><h2>Por épica</h2></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Épica</th><th class="num">HU</th><th class="num">Puntos</th></tr></thead>
+    <tbody>
+    {% for name, v in summary.by_epic.items() %}
+      <tr><td>{{ name }}</td><td class="num">{{ v.count }}</td><td class="num">{{ '%g'|format(v.points) }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>Validación HITL del pipeline</h2></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Etapa</th><th>Estado</th><th>Validó</th><th>Cuándo</th><th>Cambios</th></tr></thead>
+    <tbody>
+    {% for s in summary.pipeline %}
+      <tr>
+        <td>{{ s.stage_number }}. {{ s.name }}</td>
+        <td>{% if s.status == 'approved' %}<span class="badge ok">Aprobada</span>{% else %}<span class="badge pending">Pendiente</span>{% endif %}</td>
+        <td>{{ s.approved_by or '—' }}</td>
+        <td class="small">{{ s.approved_at[:16].replace('T', ' ') if s.approved_at else '—' }}</td>
+        <td class="small muted">{{ s.change_summary or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

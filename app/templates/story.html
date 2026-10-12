@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m with context %}
+{% block title %}{{ story.code }} · {{ story.title }}{% endblock %}
+{% block crumb %} / <a href="/p/{{ project.key }}/backlog">Backlog</a> / <span class="mono">{{ story.code }}</span>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="row" style="margin-bottom:6px">
+      <span class="code">{{ story.code }}</span>
+      {{ m.status_badge(story.status) }}
+      {{ m.type_badge(story.type) }}
+      {% if story.epic %}<span class="badge none">{{ story.epic }}</span>{% endif %}
+    </div>
+    <h1>{{ story.title }}</h1>
+  </div>
+</div>
+
+<div class="detail">
+  <div class="stack">
+    <section class="card">
+      <div class="card-head"><h2>Historia</h2><span class="spacer"></span><span class="small muted">v{{ story.version }}</span></div>
+      <p>
+        <strong>Como</strong> {{ story.role or '—' }},<br>
+        <strong>quiero</strong> {{ story.need or '—' }},<br>
+        <strong>para</strong> {{ story.benefit or '—' }}.
+      </p>
+      <h3 style="margin:16px 0 8px">Criterios de aceptación</h3>
+      {% if story.acceptance_criteria %}
+        <div class="markdown">{{ story.acceptance_criteria|md }}</div>
+      {% else %}<p class="muted">Sin criterios todavía.</p>{% endif %}
+      {% if story.source_ref %}<p class="small muted" style="margin-top:14px">Fuente: {{ story.source_ref }}</p>{% endif %}
+    </section>
+
+    {% if can_edit and story.status in ('borrador', 'en_refinamiento', 'refinada') %}
+    <details class="card">
+      <summary style="cursor:pointer;font-weight:600">✦ Refinar con agente IA</summary>
+      <p class="small muted" style="margin:10px 0">{% if agent_status.configured %}El agente reescribe los criterios en markdown y deja la HU en «Refinada». Un humano la pasa después a «Lista».{% else %}Agente no configurado: {{ agent_status.reason }}{% endif %}</p>
+      <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/agents/refine" class="stack">
+        <div class="field"><label for="r-instr">Instrucciones extra (opcional)</label><input id="r-instr" name="instructions"></div>
+        <button class="btn btn-primary" type="submit" {{ 'disabled' if not agent_status.configured }}>Refinar con agente</button>
+      </form>
+    </details>
+    {% endif %}
+    {% if can_edit and story.type and story.status not in ('descartada', 'hecha') %}
+    <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/agents/estimate" style="margin-top:10px">
+      <button class="btn" type="submit" {{ 'disabled' if not agent_status.configured }}>Estimar con agente ({{ type_labels[story.type] }})</button>
+      <span class="small muted">{% if agent_status.configured %}El agente puntúa los factores del método; el sistema calcula los puntos.{% else %}Agente no configurado: {{ agent_status.reason }}{% endif %}</span>
+    </form>
+    {% endif %}
+
+    {% if can_edit %}
+    <details class="card">
+      <summary style="cursor:pointer;font-weight:600">Editar historia</summary>
+      <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/edit" class="form-grid" style="margin-top:14px">
+        <div class="field span-2"><label for="e-title">Título</label><input id="e-title" name="title" value="{{ story.title }}" required minlength="3"></div>
+        <div class="field"><label for="e-epic">Épica</label><input id="e-epic" name="epic" value="{{ story.epic or '' }}" list="epic-list"><datalist id="epic-list">{% for e in epics %}<option value="{{ e.title }}">{% endfor %}</datalist></div>
+        <div class="field"><label for="e-type">Tipo</label>
+          <select id="e-type" name="type">
+            <option value="">Sin clasificar</option>
+            {% for k, label in type_labels.items() %}<option value="{{ k }}" {{ 'selected' if story.type == k }}>{{ label }}</option>{% endfor %}
+          </select></div>
+        <div class="field"><label for="e-role">Rol</label><input id="e-role" name="role_" value="{{ story.role or '' }}"></div>
+        <div class="field"><label for="e-need">Necesidad</label><input id="e-need" name="need" value="{{ story.need or '' }}"></div>
+        <div class="field span-2"><label for="e-benefit">Beneficio</label><input id="e-benefit" name="benefit" value="{{ story.benefit or '' }}"></div>
+        <div class="field span-2"><label for="e-criteria">Criterios de aceptación (markdown)</label><textarea id="e-criteria" name="criteria" rows="8">{{ story.acceptance_criteria or '' }}</textarea></div>
+        <div class="field span-2"><label for="e-just">Justificación del tipo</label><input id="e-just" name="type_justification" value="{{ story.type_justification or '' }}"></div>
+        <fieldset class="span-2" style="border:1px solid var(--line,#ddd);border-radius:8px;padding:12px">
+          <legend class="small"><strong>Factores de estimación</strong> · se usan los del tipo de la HU; si los completas, el sistema calcula puntos, rango y spike</legend>
+          {% set cur = (story.estimate_factors or {}).get('factors', {}) %}
+          <div class="form-grid">
+          {% for name, label, group in [('datos','Datos (HU-IA)','ia'),('modelo','Modelo o prompt (HU-IA)','ia'),('evaluacion','Evaluación (HU-IA)','ia'),('riesgo','Riesgo (HU-IA)','ia'),('integracion','Integración (HU-IA)','ia'),('complejidad','Complejidad (HU-Trad.)','trad'),('esfuerzo','Esfuerzo (HU-Trad.)','trad'),('incertidumbre','Incertidumbre (HU-Trad.)','trad')] %}
+            <div class="field"><label for="e-f-{{ name }}">{{ label }}</label>
+              <select id="e-f-{{ name }}" name="f_{{ name }}" data-group="{{ group }}"><option value="">—</option>{% for v in range(1,6) %}<option value="{{ v }}" {{ 'selected' if cur.get(name) == v }}>{{ v }}</option>{% endfor %}</select></div>
+          {% endfor %}
+          </div>
+        </fieldset>
+        <div class="field"><label for="e-points">Estimación (pts)</label><input id="e-points" name="estimate_points" inputmode="decimal" value="{{ story.estimate_points if story.estimate_points is not none else '' }}"></div>
+        <div class="field"><label for="e-method">Método de estimación</label><input id="e-method" name="estimate_method" value="{{ story.estimate_method or '' }}"></div>
+        <div class="field"><label for="e-rank">Prioridad (ranking)</label><input id="e-rank" name="priority_rank" inputmode="numeric" value="{{ story.priority_rank if story.priority_rank is not none else '' }}"></div>
+        <div class="field"><label for="e-pmethod">Método de priorización</label><input id="e-pmethod" name="priority_method" value="{{ story.priority_method or '' }}"></div>
+        <div class="field span-2"><label for="e-src">Fuente (trazabilidad)</label><input id="e-src" name="source_ref" value="{{ story.source_ref or '' }}"></div>
+        <div class="span-2"><button class="btn btn-primary" type="submit">Guardar cambios</button></div>
+      </form>
+    </details>
+    {% endif %}
+
+    <section class="card">
+      <div class="card-head"><h2>Historial</h2></div>
+      {% for e in events %}
+      <div class="event">
+        <span class="dot {{ 'auto' if e.actor_type == 'service' }}"></span>
+        <div>
+          <div><strong>{{ e.actor_name }}</strong>
+            <span class="muted">{{ {'created':'creó la HU','updated':'editó','status_changed':'cambió estado','refined':'refinó','refinement_notes':'notas de refinamiento','assigned':'reasignó','estimation_rationale':'justificó la estimación'}[e.event_type] or e.event_type }}</span>
+            {% if e.from_status and e.to_status %}
+              <span class="small">{{ status_labels[e.from_status] }} → {{ status_labels[e.to_status] }}</span>
+            {% endif %}
+          </div>
+          {% if e.diff %}<div class="small muted mono" style="word-break:break-word">{{ e.diff|tojson }}</div>{% endif %}
+          <div class="small muted">{{ e.created_at.strftime('%Y-%m-%d %H:%M') if e.created_at }}</div>
+        </div>
+      </div>
+      {% else %}<p class="muted">Sin eventos.</p>{% endfor %}
+    </section>
+  </div>
+
+  <aside class="side">
+    <section class="card">
+      <h2 style="margin-bottom:12px">Flujo</h2>
+      {% if allowed %}
+      <div class="transitions">
+        {% for st in allowed %}
+        <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/status">
+          <input type="hidden" name="status" value="{{ st }}">
+          <button class="btn btn-sm st-{{ st }}" type="submit" style="border:0">→ {{ status_labels[st] }}</button>
+        </form>
+        {% endfor %}
+      </div>
+      {% else %}
+        <p class="muted small">No tienes transiciones disponibles desde «{{ status_labels[story.status] }}».</p>
+      {% endif %}
+      {% if refinement %}
+      <div class="alert ok" style="margin-top:14px">
+        <strong>Refinamiento:</strong> {{ refinement.status }}{% if refinement.claimed_by %} · {{ refinement.claimed_by }}{% endif %}
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2 style="margin-bottom:12px">Detalles</h2>
+      <dl style="display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0">
+        <dt class="muted">Estimación</dt><dd style="margin:0">{{ m.points(story.estimate_points) }} <span class="small muted">{{ story.estimate_method or '' }}</span></dd>
+        {% if story.estimate_factors and story.estimate_factors.range %}
+        <dt class="muted">Rango</dt><dd style="margin:0">{{ story.estimate_factors.range.min }}–{{ story.estimate_factors.range.max }} pts</dd>
+        <dt class="muted">Spike</dt><dd style="margin:0">{% if story.estimate_factors.spike.required %}Requerido · {{ story.estimate_factors.spike.points }} pts de experimentación{% else %}No requerido{% endif %}</dd>
+        <dt class="muted">Factores</dt><dd style="margin:0" class="small mono">{% for k, v in story.estimate_factors.factors.items() %}{{ k }}={{ v }}{{ ' · ' if not loop.last }}{% endfor %}</dd>
+        {% endif %}
+        <dt class="muted">Prioridad</dt><dd style="margin:0">{{ '#' ~ story.priority_rank if story.priority_rank is not none else '—' }}</dd>
+        <dt class="muted">Asignado</dt><dd style="margin:0">{{ story.assignee.name if story.assignee else 'Sin asignar' }}</dd>
+        <dt class="muted">Actualizada</dt><dd style="margin:0" class="small">{{ story.updated_at.strftime('%Y-%m-%d %H:%M') if story.updated_at }}</dd>
+      </dl>
+      {% if story.type_justification %}<p class="small muted" style="margin-top:12px">{{ story.type_justification }}</p>{% endif %}
+      {% if can_edit %}
+      <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/assign" style="margin-top:14px">
+        <label for="a-user">Asignar a</label>
+        <div class="row">
+          <select id="a-user" name="user_id" style="flex:1">
+            <option value="">Sin asignar</option>
+            {% for mb in members %}<option value="{{ mb.user_id }}" {{ 'selected' if story.assignee_id == mb.user_id }}>{{ mb.user.name }}</option>{% endfor %}
+          </select>
+          <button class="btn btn-sm" type="submit">Guardar</button>
+        </div>
+      </form>
+      {% endif %}
+    </section>
+  </aside>
+</div>
+{% endblock %}
