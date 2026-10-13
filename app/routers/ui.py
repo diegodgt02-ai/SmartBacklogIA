@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import ApiKey, Project, User
 from app.agents.registry import provider_status
-from app.agents.runner import start_estimation, start_generation, start_refinement
+from app.agents.runner import start_estimation, start_generation, start_generation_from_documents, start_refinement
 from app.config import settings
 from app.models import AgentRun
 from app.routers.auth import authenticate
@@ -21,7 +21,7 @@ from app.services import projects as project_service
 from app.services import stories as story_service
 from app.services import audit
 from app.services.access import Principal, actor_for, load_project, project_role, require_member
-from app.services.documents import FolderSource, load_document_text
+from app.services.documents import SOURCE_LABELS, get_document_source, load_document_text
 from app.services.errors import AppError, Forbidden, PayloadTooLarge
 from app.agents.runner import auto_refine_if_enabled
 from app.services.refinement import notify_webhook, request_payload
@@ -68,6 +68,16 @@ def redirect(url: str) -> RedirectResponse:
 
 def _opt(raw: str) -> str | None:
     return raw.strip() or None
+
+
+def _documents(project: Project) -> dict:
+    """Documentos del proyecto para las pantallas. Un bucket inaccesible no rompe la página."""
+    label = SOURCE_LABELS[settings.agent_docs_source]
+    try:
+        source = get_document_source(project.key)
+        return {"documents": source.list(), "docs_location": source.location, "docs_label": label, "docs_error": None}
+    except AppError as exc:
+        return {"documents": [], "docs_location": "", "docs_label": label, "docs_error": exc.message}
 
 
 def _float(raw: str) -> float | None:
@@ -235,8 +245,7 @@ def backlog(
         request, "backlog.html", user, project=project, role=role, groups=groups,
         filters={"status": status, "type": type, "epic_id": epic_id, "assignee_id": assignee_id, "sort": sort},
         can_write=role in ("product_owner", "scrum_master", "service") or user.is_admin,
-        documents=FolderSource(settings.agent_docs_dir_path, project.key).list(),
-        agent_status=provider_status(),
+        agent_status=provider_status(), **_documents(project),
     )
 
 
@@ -527,7 +536,7 @@ def agents_page(key: str, request: Request, user: User = Depends(current_user), 
     ))
     return render(
         request, "agents.html", user, project=project, role=role, runs=runs,
-        status=provider_status(), documents=FolderSource(settings.agent_docs_dir_path, project.key).list(),
+        status=provider_status(), **_documents(project),
         can_write=role in ("product_owner", "scrum_master", "service") or user.is_admin,
     )
 
@@ -543,8 +552,8 @@ def generate_submit(
         if bool(filename) == bool(document_text.strip()):
             raise AppError("Elige un archivo de la carpeta o pega texto (solo uno de los dos)")
         if filename:
-            folder = FolderSource(settings.agent_docs_dir_path, project.key)
-            text = load_document_text(filename, folder.read_bytes(filename), settings.agent_max_doc_chars)
+            data = get_document_source(project.key).read_bytes(filename)
+            text = load_document_text(filename, data, settings.agent_max_doc_chars)
             source = filename
         else:
             text = document_text.strip()
@@ -554,6 +563,23 @@ def generate_submit(
         run = start_generation(
             db, project, source_name=source, text=text, instructions=_opt(instructions),
             requested_by_id=user.id, background=background,
+        )
+        flash(request, _agent_message(run), "ok" if run.status != "failed" else "error")
+    except AppError as exc:
+        db.rollback()
+        flash(request, exc.message, "error")
+    return redirect(f"/p/{key}/agents")
+
+
+@router.post("/p/{key}/agents/generate-from-documents")
+def generate_from_documents_submit(
+    key: str, request: Request, background: BackgroundTasks, instructions: str = Form(""),
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    try:
+        project, _ = _project_for(db, key, user, write=True)
+        run = start_generation_from_documents(
+            db, project, instructions=_opt(instructions), requested_by_id=user.id, background=background,
         )
         flash(request, _agent_message(run), "ok" if run.status != "failed" else "error")
     except AppError as exc:

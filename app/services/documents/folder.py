@@ -22,12 +22,18 @@ class DocumentInfo:
 
 
 class FolderSource:
+    kind = "folder"
+
     def __init__(self, root: Path, project_key: str):
         self.root = Path(root).resolve()
         self.project_dir = (self.root / project_key).resolve()
         # El nombre del proyecto no puede escapar de la raíz (la clave ya viene validada, esto es defensa extra).
         if self.root not in self.project_dir.parents:
             raise Unprocessable("Clave de proyecto inválida para la carpeta de documentos")
+
+    @property
+    def location(self) -> str:
+        return str(self.project_dir)
 
     def list(self) -> list[DocumentInfo]:
         if not self.project_dir.is_dir():

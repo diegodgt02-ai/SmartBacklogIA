@@ -16,4 +16,6 @@ pypdf==6.20.0
 # Agentes: ADK y su cliente de Gemini (pinned a la versión probada)
 google-adk==2.11.0
 google-genai==2.29.0
+# Fuente de documentos opcional en Cloud Storage (AGENT_DOCS_SOURCE=gcs)
+google-cloud-storage==3.1.0
 pytest==8.3.5

@@ -396,7 +396,7 @@ La UI lo muestra renderizado con markdown **sin HTML**: si el texto trae etiquet
 
 ## 4. Agentes IA embebidos (ADK + Gemini)
 
-Los agentes viven dentro del backend, en `app/agents/`. Sirven para **generar HU desde documentos** y **refinar HU**. No necesitan MCP ni un servicio aparte.
+Los agentes viven dentro del backend, en `app/agents/`. Sirven para **generar HU desde documentos** y **refinar HU**. No necesitan MCP ni un servicio aparte. Los documentos se leen de **una sola fuente**: una carpeta local (por defecto) **o** un bucket de Cloud Storage (sección 4.3), nunca de ambas.
 
 ```
 app/agents/
@@ -404,10 +404,11 @@ app/agents/
   registry.py         elige el proveedor según AGENT_PROVIDER: none | stub | adk
   runner.py           orquesta: crea agent_runs, persiste HU con app/services, aplica reglas HITL
   prompts.py          instrucciones del agente (formato de HU, criterios en markdown)
+  document_tools.py   herramientas de solo lectura del agente de documentos (listar y leer la carpeta o el bucket)
   providers/
     stub.py           determinista, sin LLM (demo y pruebas)
-    adk.py            Google ADK: LlmAgent + Runner + output_schema → Gemini
-app/services/documents/   lectura de PDF, BPMN, MD y TXT desde carpetas locales
+    adk.py            Google ADK: LlmAgent + Runner + output_schema → Gemini; AgentTool para el agente de documentos
+app/services/documents/   lectura de PDF, BPMN, MD y TXT desde carpetas locales (folder.py) o Cloud Storage (gcs.py)
 app/routers/agents.py     endpoints /api/v1/.../agents/*
 ```
 
@@ -429,11 +430,12 @@ app/routers/agents.py     endpoints /api/v1/.../agents/*
 | `GET /api/v1/projects/{key}/agents/documents` | Archivos de `documents/<KEY>/` | `200` |
 | `POST /api/v1/projects/{key}/agents/generate-stories` | Genera HU. Body: `{"filename": "proceso.bpmn"}` **o** `{"document_text": "...", "source_name": "reunion"}`; opcional `instructions` | `202` con el run |
 | `POST /api/v1/projects/{key}/agents/generate-stories/upload` | Igual, pero subiendo el archivo (`multipart`) | `202` |
+| `POST /api/v1/projects/{key}/agents/generate-stories/from-documents` | Genera HU desde **todos** los documentos del proyecto con el agente de documentos (sección 4.4). Body opcional `{"instructions": "..."}` | `202` |
 | `POST /api/v1/projects/{key}/stories/{code}/agents/refine` | Refina la HU (la pasa a `en_refinamiento` si hace falta). Body opcional `{"instructions": "..."}` | `202` |
 | `GET /api/v1/projects/{key}/agents/runs` | Últimas 100 ejecuciones del proyecto | `200` |
 | `GET /api/v1/agents/runs/{id}` | Detalle de una ejecución | `200` |
 
-Errores: `503` si el proveedor no está configurado (el resto de la API sigue funcionando); `413` si el documento supera `AGENT_MAX_DOC_CHARS`; `422` si el archivo no se puede leer (PDF escaneado, BPMN con entidades externas, formato no soportado, ruta inválida); `404` si el archivo no existe en la carpeta del proyecto.
+Errores: `503` si el proveedor no está configurado o el bucket no responde (el resto de la API sigue funcionando); `413` si el documento supera `AGENT_MAX_DOC_CHARS`; `422` si el archivo no se puede leer (PDF escaneado, BPMN con entidades externas, formato no soportado, ruta inválida); `404` si el archivo no existe en la carpeta del proyecto.
 
 Ejemplo, generar desde un BPMN de la carpeta:
 
@@ -476,7 +478,62 @@ documents/
 
 Un proyecto solo ve su subcarpeta. Las rutas con `..`, nombres con carpetas y symlinks que salen de la carpeta se rechazan. Los documentos se envían a Google al generar HU: usa solo los que tu cuenta esté autorizada a procesar.
 
-### 4.3 Activar Gemini (paso a paso)
+`GET /api/v1/projects/{key}/agents/documents` devuelve `source` (`folder` o `gcs`), `folder` (la ruta o `gs://...`) y `documents`.
+
+### 4.3 Documentos en un bucket de Cloud Storage (opcional)
+
+La fuente de documentos es **excluyente**: `AGENT_DOCS_SOURCE=folder` (por defecto) **o** `AGENT_DOCS_SOURCE=gcs`. Con `gcs` no se lee la carpeta local (aunque siga montada), y con `folder` no se consulta el bucket. La API, las pantallas, el agente de documentos y `scripts/try_agent.py` usan siempre la misma fuente; `GET /api/v1/agents/status` la informa en `docs_source`.
+
+La configuración se valida al arrancar. La app **no arranca** si:
+
+| Configuración | Mensaje |
+|---|---|
+| `AGENT_DOCS_SOURCE=gcs` sin `AGENT_DOCS_BUCKET` | `AGENT_DOCS_SOURCE=gcs requiere AGENT_DOCS_BUCKET` |
+| `AGENT_DOCS_SOURCE=folder` con `AGENT_DOCS_BUCKET`, `AGENT_DOCS_PREFIX` o `GCP_PROJECT` | `AGENT_DOCS_SOURCE=folder no usa ...: vacíalas, o usa AGENT_DOCS_SOURCE=gcs` |
+| Un valor distinto de `folder` o `gcs` | error de validación de `agent_docs_source` |
+
+Para leer los documentos desde un bucket, con la **misma estructura** (una carpeta por clave de proyecto):
+
+```
+gs://<AGENT_DOCS_BUCKET>/<AGENT_DOCS_PREFIX>/PAGO/proceso-pago.bpmn
+gs://<AGENT_DOCS_BUCKET>/<AGENT_DOCS_PREFIX>/PAGO/reunion.md
+```
+
+1. **Configura `.env`:**
+   ```
+   AGENT_DOCS_SOURCE=gcs
+   AGENT_DOCS_BUCKET=mi-bucket
+   AGENT_DOCS_PREFIX=spb          # opcional; vacío = raíz del bucket
+   GCP_PROJECT=mi-proyecto        # opcional
+   ```
+2. **Credenciales** (Application Default Credentials, solo lectura: rol `roles/storage.objectViewer` sobre el bucket):
+   - Local: `gcloud auth application-default login`. En Docker, descomenta en `docker-compose.yml` el volumen `~/.config/gcloud:/root/.config/gcloud:ro`.
+   - Servidor: una cuenta de servicio con `GOOGLE_APPLICATION_CREDENTIALS=/ruta/al/json` (monta el archivo como volumen o secreto).
+3. **Sube los documentos:** `gcloud storage cp documents/PAGO/* gs://mi-bucket/spb/PAGO/`.
+4. **Recrea el contenedor** (`docker compose up -d app`) y revisa `GET /api/v1/projects/PAGO/agents/documents`.
+
+Las mismas reglas que la carpeta: solo los archivos directos de `<KEY>/` (las subcarpetas se ignoran), solo nombres sin rutas, 20 MB por archivo, formatos PDF/BPMN/MD/TXT. Un bucket inaccesible responde `503` en la API; las pantallas siguen funcionando y muestran el error. Para volver a la carpeta: `AGENT_DOCS_SOURCE=folder` **y** vacía `AGENT_DOCS_BUCKET`, `AGENT_DOCS_PREFIX` y `GCP_PROJECT`.
+
+Subir un archivo (`/generate-stories/upload`) o pegar texto (`document_text`) no son fuentes de documentos: el contenido se procesa en memoria y no se guarda en la carpeta ni en el bucket.
+
+### 4.4 Generar desde todos los documentos (agente de documentos como AgentTool)
+
+`POST /api/v1/projects/{key}/agents/generate-stories/from-documents` (o el botón **Generar HU desde todos los documentos** en `/p/<KEY>/agents`) usa dos agentes ADK:
+
+```
+generador (LlmAgent, output_schema = HU)
+  └─ AgentTool(agente_documentos)            ← el generador le pregunta qué hay y qué dice cada documento
+        └─ listar_documentos, leer_documento ← solo lectura, ligadas a la carpeta o bucket de ESE proyecto
+```
+
+- El agente de documentos no puede salir de la carpeta del proyecto: sus herramientas solo conocen esa fuente.
+- La lectura total por ejecución está limitada por `AGENT_MAX_DOC_CHARS` (tramos de 15 000 caracteres).
+- Cada HU guarda su documento de origen (`source_ref` = `documento · sección`). La clave de idempotencia es documento + título: repetir la ejecución, o generar desde ese mismo archivo, actualiza en vez de duplicar.
+- `agent_runs.result.documents_read` lista los documentos leídos; los tokens incluyen los del agente de documentos.
+- Con `AGENT_PROVIDER=stub` lee todos los documentos en orden, sin LLM.
+- Con la Gemini API (AI Studio), ADK entrega la salida estructurada del generador mediante la herramienta interna `set_model_response`, porque combina herramientas y `output_schema`.
+
+### 4.5 Activar Gemini (paso a paso)
 
 El código está listo; los pasos con tu cuenta los haces tú:
 
@@ -509,19 +566,19 @@ Para probar sin Gemini usa `AGENT_PROVIDER=stub`: mismo flujo, con un proveedor 
 
 Verificado: con `gemini-3.1-pro-preview` el comando de la prueba directa generó HU de un BPMN real (con tokens contados) y refinó una HU de muestra. Los tests cubren además el adaptador ADK completo (LlmAgent, Runner, sesión, `output_schema`, conteo de tokens) con un modelo falso que implementa `BaseLlm`, sin red.
 
-### 4.4 Script `try_agent.py`
+### 4.6 Script `try_agent.py`
 
 | Uso | Qué hace |
 |---|---|
 | `--list-models` | Lista los modelos que tu clave puede usar |
 | `proceso-pago.bpmn --project PAGO` | Busca el archivo en `documents/PAGO/` y muestra las HU propuestas |
-| `documents/PAGO/proceso-pago.bpmn --project PAGO` | También acepta la ruta con la carpeta del proyecto |
+| `documents/PAGO/proceso-pago.bpmn --project PAGO` | También acepta la ruta con la carpeta del proyecto; solo se usa el nombre y se lee de la fuente configurada (carpeta **o** bucket) |
 | `... --refine-sample` | Además refina una HU de ejemplo. No la guarda |
 | `... --save` | Guarda las HU en el proyecto (en `borrador`). Requiere que el proyecto exista |
 
 Dentro del contenedor, la carpeta de documentos está en `/data/documents`. El script resuelve los nombres a partir de `AGENT_DOCS_DIR`, así que no necesitas escribir esa ruta.
 
-### 4.5 Problemas frecuentes
+### 4.7 Problemas frecuentes
 
 | Mensaje | Causa y solución |
 |---|---|
@@ -534,6 +591,10 @@ Dentro del contenedor, la carpeta de documentos está en `/data/documents`. El s
 | `El proyecto X no existe` | Con `--save`, crea el proyecto antes (ingesta o UI) |
 | `503` en la API o en la UI | El proveedor no está configurado. Revisa `AGENT_PROVIDER` y `GOOGLE_API_KEY` |
 | `422` al generar desde un PDF | El PDF no tiene texto (es un escaneo). Pásalo por OCR |
+| La app no arranca: `AGENT_DOCS_SOURCE=gcs requiere AGENT_DOCS_BUCKET` | Define `AGENT_DOCS_BUCKET` o vuelve a `folder` |
+| La app no arranca: `AGENT_DOCS_SOURCE=folder no usa ...` | Quedaron variables del bucket con `folder`. Vacíalas o usa `gcs` |
+| `No se pudo conectar con Cloud Storage` / `No se pudo listar gs://...` | Faltan credenciales (ADC) o la identidad no tiene `roles/storage.objectViewer` sobre el bucket |
+| `No hay documentos en ...` | La carpeta o el prefijo `<KEY>/` del bucket está vacío. Revisa `AGENT_DOCS_PREFIX` y la clave del proyecto |
 
 ---
 
@@ -553,7 +614,10 @@ Variables (`.env` o entorno del contenedor):
 | `AGENT_EXECUTION` | `background` | `background` (segundo plano) o `inline` (espera el resultado) |
 | `AGENT_AUTO_REFINE` | `false` | `true`: al pasar una HU a `en_refinamiento`, el agente interno la refina |
 | `AGENT_MAX_DOC_CHARS` | `200000` | Tamaño máximo del documento en caracteres (`413` si se excede) |
-| `AGENT_DOCS_DIR` | `documents` | Carpeta raíz de documentos por proyecto (en Docker: `/data/documents`) |
+| `AGENT_DOCS_SOURCE` | `folder` | Fuente única de documentos: `folder` (carpeta `AGENT_DOCS_DIR`) **o** `gcs` (bucket). Ver sección 4.3 |
+| `AGENT_DOCS_DIR` | `documents` | Solo `folder`. Carpeta raíz de documentos por proyecto (en Docker: `/data/documents`) |
+| `AGENT_DOCS_BUCKET` / `AGENT_DOCS_PREFIX` | vacío | Solo `gcs` (bucket obligatorio). `gs://BUCKET/PREFIX/<KEY>/`. Con `folder` deben quedar vacías |
+| `GCP_PROJECT` | vacío | Solo `gcs`, opcional. Proyecto de GCP del cliente de Storage |
 | `AGENT_PRICE_IN_PER_1M` / `AGENT_PRICE_OUT_PER_1M` | vacío | Precio por millón de tokens; si no se definen, `cost_usd` queda vacío |
 
 ---
@@ -568,7 +632,7 @@ TEST_DATABASE_URL=postgresql+psycopg://spb:spb@localhost:5433/spb_test .venv/bin
 Para un caso: `pytest tests/test_api.py::test_refinement_cycle`.
 Con Postgres, crea antes la base `spb_test` (`docker compose exec db createdb -U spb spb_test`). Los tests borran sus datos después de cada caso; no uses la base de desarrollo.
 
-Cubren: ingesta idempotente, ciclo de refinamiento con control de versión, permisos por rol, validación HITL, asignación por correo desde ADK, reportes y exportación, y las pantallas principales.
+Cubren: fuente de documentos en bucket (cliente falso, sin red), agente de documentos como AgentTool (modelo falso), ingesta idempotente, ciclo de refinamiento con control de versión, permisos por rol, validación HITL, asignación por correo desde ADK, reportes y exportación, y las pantallas principales.
 
 ---
 
@@ -580,7 +644,7 @@ app/
   models.py          modelo de datos (SQLAlchemy 2)
   schemas.py         contratos de entrada y salida
   services/          reglas de negocio: workflow, stories, refinement, projects, access, audit
-  services/documents/  lectura de PDF, BPMN, MD y TXT desde carpetas por proyecto
+  services/documents/  lectura de PDF, BPMN, MD y TXT desde carpetas o un bucket, por proyecto
   routers/           API JSON (auth, admin, projects, stories, adk, agents) y web (ui.py)
   agents/            agentes IA: puertos, runner, proveedores stub y adk (ver sección 4)
   templates/         Jinja2 (UI)

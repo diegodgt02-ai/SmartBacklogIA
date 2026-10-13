@@ -46,7 +46,8 @@
   <summary>✦ Generar HU desde documento con agente IA</summary>
   <p class="small muted" style="margin:10px 0">{% if agent_status.configured %}Proveedor: <strong>{{ agent_status.provider }}</strong> · modelo {{ agent_status.model }}{% else %}Agente no configurado: {{ agent_status.reason }}{% endif %}</p>
   <form method="post" action="/p/{{ project.key }}/agents/generate" class="stack" style="margin-top:10px">
-    <div class="field"><label for="g-file">Archivo de la carpeta del proyecto ({{ documents|length }} disponibles)</label>
+    {% if docs_error %}<p class="small" style="color:var(--danger);margin:0">{{ docs_error }}</p>{% endif %}
+    <div class="field"><label for="g-file">Archivo del proyecto · {{ docs_label }} ({{ documents|length }} disponibles)</label>
       <select id="g-file" name="filename"><option value="">— ninguno, usar texto pegado —</option>
         {% for d in documents %}<option value="{{ d.name }}">{{ d.name }} ({{ (d.size / 1024)|round(1) }} KB)</option>{% endfor %}
       </select></div>

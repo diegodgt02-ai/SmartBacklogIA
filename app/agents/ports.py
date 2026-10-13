@@ -6,9 +6,12 @@ quien persiste es `AgentRunner`, que aplica las reglas de HITL y de estados.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from app.agents.document_tools import DocumentTools
 
 
 class AgentNotConfigured(Exception):
@@ -25,6 +28,7 @@ class GeneratedStory(BaseModel):
     type: Literal["HU_IA", "HU_TRADICIONAL"] | None = None
     type_justification: str | None = None
     source_section: str | None = Field(None, description="Página, sección o proceso del documento de origen")
+    source_document: str | None = Field(None, max_length=255, description="Documento de origen (generación desde varios documentos)")
 
 
 class GenerationOutput(BaseModel):
@@ -45,6 +49,14 @@ class GenerationInput(BaseModel):
     project_name: str
     source_name: str
     text: str
+    instructions: str | None = None
+
+
+class DocumentGenerationInput(BaseModel):
+    """Generación desde todos los documentos del proyecto: el agente decide qué leer con sus herramientas."""
+
+    project_key: str
+    project_name: str
     instructions: str | None = None
 
 
@@ -78,3 +90,7 @@ class AgentProvider(Protocol):
     def refine_story(self, data: RefinementInput) -> tuple[RefinementOutput, Usage]: ...
 
     def estimate_story(self, data: EstimationInput) -> tuple[EstimationOutput, Usage]: ...
+
+    def generate_from_documents(
+        self, data: DocumentGenerationInput, tools: "DocumentTools"
+    ) -> tuple[GenerationOutput, Usage]: ...

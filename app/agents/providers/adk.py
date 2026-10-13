@@ -1,8 +1,12 @@
 """Proveedor Google ADK con Gemini. ADK se importa aquí, así que el backend arranca aunque falle.
 
 Cada llamada crea un LlmAgent con output_schema (salida JSON validada por Pydantic) y una
-sesión efímera en memoria. No se guarda estado entre llamadas ni se usan herramientas: el
-agente solo devuelve datos; quien escribe en la base es AgentRunner.
+sesión efímera en memoria. No se guarda estado entre llamadas. El agente solo devuelve datos;
+quien escribe en la base es AgentRunner.
+
+La generación desde documentos usa dos agentes: el generador tiene como herramienta
+(AgentTool) al agente de documentos, que lista y lee la carpeta o el bucket del proyecto
+con herramientas de solo lectura (app/agents/document_tools.py).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.ports import (
     AgentNotConfigured,
+    DocumentGenerationInput,
     EstimationInput,
     EstimationOutput,
     GenerationInput,
@@ -26,7 +31,13 @@ from app.agents.ports import (
     RefinementOutput,
     Usage,
 )
-from app.agents.prompts import ESTIMATOR_INSTRUCTION, GENERATOR_INSTRUCTION, REFINER_INSTRUCTION
+from app.agents.prompts import (
+    DOCUMENT_AGENT_INSTRUCTION,
+    ESTIMATOR_INSTRUCTION,
+    GENERATOR_FROM_DOCS_INSTRUCTION,
+    GENERATOR_INSTRUCTION,
+    REFINER_INSTRUCTION,
+)
 
 
 # Esquemas que ve el modelo. Gemini rechaza restricciones como minLength/maxLength/maxItems
@@ -46,6 +57,7 @@ class _LlmStory(BaseModel):
     type: Literal["HU_IA", "HU_TRADICIONAL"] | None = Field(None, description="Tipo de HU")
     type_justification: str | None = Field(None, description="Justificación del tipo")
     source_section: str | None = Field(None, description="Página, sección o actividad del documento de origen")
+    source_document: str | None = Field(None, description="Nombre del documento de origen (solo al leer varios documentos)")
 
 
 class _LlmGenerationOutput(BaseModel):
@@ -81,8 +93,11 @@ class AdkProvider:
         """`llm` permite inyectar un BaseLlm (pruebas sin red). En producción se usa el nombre de Gemini."""
         try:
             from google.adk.agents import LlmAgent
+            from google.adk.apps import App
+            from google.adk.plugins.base_plugin import BasePlugin
             from google.adk.runners import Runner
             from google.adk.sessions import InMemorySessionService
+            from google.adk.tools.agent_tool import AgentTool
             from google.genai import types
         except ImportError as exc:  # pragma: no cover - depende del entorno
             raise AgentNotConfigured("google-adk no está instalado (revisa requirements.txt)") from exc
@@ -94,19 +109,44 @@ class AdkProvider:
         self._model_ref = llm if llm is not None else model
         self.model = model if isinstance(model, str) else getattr(model, "model", None)
         self._LlmAgent = LlmAgent
+        self._App = App
+        self._BasePlugin = BasePlugin
+        self._AgentTool = AgentTool
         self._Runner = Runner
         self._sessions_cls = InMemorySessionService
         self._types = types
 
-    def _call(self, instruction: str, llm_schema: type[BaseModel], schema: type[BaseModel], user_text: str):
+    def _usage_plugin(self, usage: Usage):
+        """Cuenta tokens de TODAS las llamadas al modelo, también las del agente que corre como AgentTool.
+
+        AgentTool ejecuta su agente en un Runner propio cuyos eventos no llegan aquí, pero hereda
+        los plugins del Runner padre: por eso se cuenta en un plugin y no leyendo los eventos.
+        """
+
+        class _UsagePlugin(self._BasePlugin):
+            async def after_model_callback(self, *, callback_context, llm_response):
+                meta = llm_response.usage_metadata
+                if meta is not None:
+                    usage.tokens_in += meta.prompt_token_count or 0
+                    usage.tokens_out += meta.candidates_token_count or 0
+                return None
+
+        return _UsagePlugin(name="spb_usage")
+
+    def _call(
+        self, instruction: str, llm_schema: type[BaseModel], schema: type[BaseModel], user_text: str, tools=None
+    ):
         agent = self._LlmAgent(
             name="spb_agent",
             model=self._model_ref,
             instruction=instruction,
             output_schema=llm_schema,
+            tools=tools or [],
         )
+        usage = Usage(model=self.model)
         sessions = self._sessions_cls()
-        runner = self._Runner(app_name="spb", agent=agent, session_service=sessions)
+        app = self._App(name="spb", root_agent=agent, plugins=[self._usage_plugin(usage)])
+        runner = self._Runner(app=app, session_service=sessions)
 
         async def _run():
             session_id = uuid.uuid4().hex
@@ -114,13 +154,8 @@ class AdkProvider:
             if inspect.isawaitable(created):
                 await created
             message = self._types.Content(role="user", parts=[self._types.Part(text=user_text)])
-            usage = Usage(model=self.model)
             final_text = None
             async for event in runner.run_async(user_id="spb", session_id=session_id, new_message=message):
-                meta = event.usage_metadata
-                if meta is not None:
-                    usage.tokens_in += meta.prompt_token_count or 0
-                    usage.tokens_out += meta.candidates_token_count or 0
                 if event.is_final_response() and event.content and event.content.parts:
                     final_text = "".join(part.text or "" for part in event.content.parts)
             if not final_text:
@@ -138,6 +173,28 @@ class AdkProvider:
             + f"\n<documento>\n{data.text}\n</documento>"
         )
         return self._call(GENERATOR_INSTRUCTION, _LlmGenerationOutput, GenerationOutput, user_text)
+
+    def generate_from_documents(self, data: DocumentGenerationInput, tools) -> tuple[GenerationOutput, Usage]:
+        document_agent = self._LlmAgent(
+            name="agente_documentos",
+            model=self._model_ref,
+            description=(
+                "Agente de documentos del proyecto: lista y lee los documentos de su carpeta o bucket "
+                "(PDF, BPMN, MD, TXT) y responde con su contenido citando documento y sección. "
+                "Pídele qué documentos hay o qué dice un documento."
+            ),
+            instruction=DOCUMENT_AGENT_INSTRUCTION,
+            tools=tools.functions,
+        )
+        user_text = (
+            f"Proyecto: {data.project_key} — {data.project_name}\n"
+            + (f"Instrucciones adicionales: {data.instructions}\n" if data.instructions else "")
+            + "Genera las HU a partir de los documentos del proyecto. Consulta a agente_documentos."
+        )
+        return self._call(
+            GENERATOR_FROM_DOCS_INSTRUCTION, _LlmGenerationOutput, GenerationOutput, user_text,
+            tools=[self._AgentTool(agent=document_agent)],
+        )
 
     def refine_story(self, data: RefinementInput) -> tuple[RefinementOutput, Usage]:
         story = data.story

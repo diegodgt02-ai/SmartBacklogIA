@@ -2,8 +2,10 @@
 
 Uso (con AGENT_PROVIDER, GOOGLE_API_KEY y AGENT_MODEL en .env o en el entorno):
     python scripts/try_agent.py --list-models
-    python scripts/try_agent.py proceso-pago.bpmn --project PAGO            # busca en AGENT_DOCS_DIR/PAGO/
-    python scripts/try_agent.py ruta/al/archivo.pdf --project PAGO --refine-sample
+    python scripts/try_agent.py proceso-pago.bpmn --project PAGO            # AGENT_DOCS_DIR/PAGO/ o gs://.../PAGO/
+    python scripts/try_agent.py proceso-pago.bpmn --project PAGO --refine-sample
+
+El documento se lee solo de la fuente configurada (AGENT_DOCS_SOURCE=folder o gcs), nunca de otra ruta.
     python scripts/try_agent.py proceso-pago.bpmn --project PAGO --save      # guarda las HU en borrador
 
 Dentro de Docker:
@@ -28,7 +30,7 @@ from app.agents.registry import get_provider  # noqa: E402
 from app.agents.runner import run_out, start_generation  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
-from app.services.documents import FolderSource, load_document_text  # noqa: E402
+from app.services.documents import get_document_source, load_document_text  # noqa: E402
 from app.services.errors import AppError  # noqa: E402
 
 
@@ -48,18 +50,14 @@ def list_models() -> None:
 
 
 def read_document(reference: str, project_key: str) -> tuple[str, str]:
-    """Devuelve (nombre, texto). Acepta una ruta existente o solo el nombre dentro de la carpeta del proyecto."""
+    """Devuelve (nombre, texto). Lee SOLO de la fuente configurada (AGENT_DOCS_SOURCE): carpeta O bucket."""
     path = Path(reference)
-    if path.is_file():
-        data, name = path.read_bytes(), path.name
-    else:
-        # Acepta documents/PAGO/archivo.bpmn aunque la ruta no exista dentro del contenedor.
-        if path.parent.name.upper() == project_key.upper():
-            reference = path.name
-
-        folder = FolderSource(settings.agent_docs_dir_path, project_key.upper())
-        data, name = folder.read_bytes(reference), reference
-    return name, load_document_text(name, data, settings.agent_max_doc_chars)
+    # Acepta documents/PAGO/archivo.bpmn o gs://.../PAGO/archivo.bpmn: se usa solo el nombre del archivo.
+    if path.parent.name.upper() == project_key.upper():
+        reference = path.name
+    source = get_document_source(project_key.upper())
+    print(f"Fuente de documentos ({settings.agent_docs_source}): {source.location}")
+    return reference, load_document_text(reference, source.read_bytes(reference), settings.agent_max_doc_chars)
 
 
 def save_run(name: str, text: str, project_key: str) -> None:
@@ -90,7 +88,7 @@ def save_run(name: str, text: str, project_key: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("document", nargs="?", help="nombre del archivo en la carpeta del proyecto, o una ruta")
+    parser.add_argument("document", nargs="?", help="nombre del archivo en la fuente del proyecto (carpeta o bucket)")
     parser.add_argument("--project", default="PAGO", help="clave del proyecto (carpeta dentro de documents/)")
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--refine-sample", action="store_true", help="además refina una HU de ejemplo, sin guardarla")

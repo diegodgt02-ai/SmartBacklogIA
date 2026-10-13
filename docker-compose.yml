@@ -26,6 +26,8 @@ services:
     volumes:
       # Documentos por proyecto (documents/<KEY>/), solo lectura para la app
       - ./documents:/data/documents:ro
+      # Opcional, para AGENT_DOCS_SOURCE=gcs con credenciales de `gcloud auth application-default login`:
+      # - ~/.config/gcloud:/root/.config/gcloud:ro
     depends_on:
       db:
         condition: service_healthy

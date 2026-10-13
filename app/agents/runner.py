@@ -20,7 +20,15 @@ from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.agents.ports import AgentNotConfigured, EstimationInput, GenerationInput, RefinementInput
+from app.agents.document_tools import make_document_tools
+from app.agents.ports import (
+    AgentNotConfigured,
+    DocumentGenerationInput,
+    EstimationInput,
+    GeneratedStory,
+    GenerationInput,
+    RefinementInput,
+)
 from app.agents.registry import get_provider
 from app.config import settings
 from app.db import SessionLocal
@@ -29,6 +37,7 @@ from app.schemas import RefinementResult
 from app.services import audit
 from app.services import refinement as refinement_service
 from app.services import stories as story_service
+from app.services.documents import get_document_source
 from app.services.errors import Conflict, NotFound, ServiceUnavailable, Unprocessable
 from app.services.workflow import Actor
 
@@ -138,14 +147,7 @@ def execute_generation(run_id: int, project_key: str, source_name: str, text: st
                 )
             )
             actor = ServiceActor(provider.name).as_actor()
-            created, updated = [], []
-            for item in output.stories:
-                data = item.model_dump(exclude_none=True, exclude={"source_section"})
-                data["source_ref"] = f"{source_name} · {item.source_section}" if item.source_section else source_name
-                story, is_new = story_service.upsert_story(
-                    db, project, data, actor, external_id=external_id_for(source_name, item.title)
-                )
-                (created if is_new else updated).append(story.code)
+            created, updated = _persist_stories(db, project, output.stories, actor, source_name)
             run.result = {"created": created, "updated": updated, "total": len(output.stories)}
             run.model, run.tokens_in, run.tokens_out = usage.model, usage.tokens_in, usage.tokens_out
             run.cost_usd = _cost(usage.tokens_in, usage.tokens_out)
@@ -157,6 +159,93 @@ def execute_generation(run_id: int, project_key: str, source_name: str, text: st
             run.status, run.error = "failed", _error_text(exc)
             db.commit()
             log.warning("Generación %s falló: %s", run_id, exc)
+        finally:
+            run = db.get(AgentRun, run_id)
+            run.finished_at = utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+def _persist_stories(
+    db: Session, project: Project, items: list[GeneratedStory], actor: Actor, default_source: str,
+    *, per_item_source: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Crea o actualiza las HU generadas (en borrador). La clave de idempotencia es documento + título.
+
+    Con un solo documento, la fuente es siempre su nombre (aunque el modelo llene source_document),
+    así reprocesar el mismo archivo sigue sin duplicar.
+    """
+    created, updated = [], []
+    for item in items:
+        source = (item.source_document if per_item_source else None) or default_source
+        data = item.model_dump(exclude_none=True, exclude={"source_section", "source_document"})
+        data["source_ref"] = f"{source} · {item.source_section}" if item.source_section else source
+        story, is_new = story_service.upsert_story(
+            db, project, data, actor, external_id=external_id_for(source, item.title)
+        )
+        (created if is_new else updated).append(story.code)
+    return created, updated
+
+
+# ---------- generación de HU desde todos los documentos (agente de documentos como AgentTool) ----------
+
+def start_generation_from_documents(
+    db: Session,
+    project: Project,
+    *,
+    instructions: str | None,
+    requested_by_id: int | None,
+    background: BackgroundTasks | None,
+) -> AgentRun:
+    provider_name, model = _provider_identity()
+    # Falla aquí (antes de crear el run) si la fuente no está configurada o el bucket no responde.
+    source = get_document_source(project.key)
+    if not source.list():
+        raise Unprocessable(f"No hay documentos en {source.location}")
+    run = _new_run(
+        db, project, "generate_from_docs", provider_name, model,
+        input_ref=f"documentos: {source.location}"[:500], requested_by_id=requested_by_id,
+    )
+    run_id = run.id
+    _dispatch(background, execute_generation_from_documents, run_id, project.key, instructions)
+    db.expire_all()
+    return db.get(AgentRun, run_id)
+
+
+def execute_generation_from_documents(run_id: int, project_key: str, instructions: str | None) -> None:
+    db = SessionLocal()
+    try:
+        run = db.get(AgentRun, run_id)
+        project = db.scalar(select(Project).where(Project.key == project_key))
+        run.status, run.started_at = "running", utcnow()
+        db.commit()
+        try:
+            provider = get_provider()
+            tools = make_document_tools(get_document_source(project.key), settings.agent_max_doc_chars)
+            output, usage = provider.generate_from_documents(
+                DocumentGenerationInput(project_key=project.key, project_name=project.name, instructions=instructions),
+                tools,
+            )
+            actor = ServiceActor(provider.name).as_actor()
+            created, updated = _persist_stories(
+                db, project, output.stories, actor, "documentos", per_item_source=True
+            )
+            run.result = {
+                "created": created, "updated": updated, "total": len(output.stories),
+                "documents_read": tools.documents_read,
+            }
+            run.input_chars = tools.chars_served
+            run.model, run.tokens_in, run.tokens_out = usage.model, usage.tokens_in, usage.tokens_out
+            run.cost_usd = _cost(usage.tokens_in, usage.tokens_out)
+            run.status = "succeeded"
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - igual que execute_generation: sin HU a medias
+            db.rollback()
+            run = db.get(AgentRun, run_id)
+            run.status, run.error = "failed", _error_text(exc)
+            db.commit()
+            log.warning("Generación desde documentos %s falló: %s", run_id, exc)
         finally:
             run = db.get(AgentRun, run_id)
             run.finished_at = utcnow()
@@ -357,10 +446,12 @@ __all__ = [
     "auto_refine_if_enabled",
     "execute_estimation",
     "execute_generation",
+    "execute_generation_from_documents",
     "execute_refinement",
     "external_id_for",
     "run_out",
     "start_estimation",
     "start_generation",
+    "start_generation_from_documents",
     "start_refinement",
 ]

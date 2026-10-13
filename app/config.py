@@ -1,5 +1,7 @@
 from pathlib import Path
+from typing import Literal
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,11 +18,46 @@ class Settings(BaseSettings):
     agent_execution: str = "background"  # background | inline
     agent_auto_refine: bool = False
     agent_max_doc_chars: int = 200_000
-    agent_docs_dir: str = "documents"
+    # Fuente de documentos, excluyente: folder (agent_docs_dir/<KEY>/) O gcs (gs://bucket/prefix/<KEY>/).
+    agent_docs_source: Literal["folder", "gcs"] = "folder"
+    agent_docs_dir: str = "documents"  # solo folder
+    agent_docs_bucket: str | None = None  # solo gcs
+    agent_docs_prefix: str = ""  # solo gcs
+    gcp_project: str | None = None  # solo gcs
     google_api_key: str | None = None
     agent_price_in_per_1m: float | None = None
     agent_price_out_per_1m: float | None = None
 
+
+    @field_validator("agent_docs_source", mode="before")
+    @classmethod
+    def _normalize_source(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    # Una variable vacía en .env (p. ej. AGENT_PRICE_IN_PER_1M=) significa «sin definir», no "".
+    @field_validator(
+        "agent_docs_bucket", "gcp_project", "agent_price_in_per_1m", "agent_price_out_per_1m", mode="before"
+    )
+    @classmethod
+    def _blank_is_none(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _one_document_source(self):
+        """Carpeta O bucket: una configuración que mezcla ambas no arranca."""
+        if self.agent_docs_source == "gcs" and not self.agent_docs_bucket:
+            raise ValueError("AGENT_DOCS_SOURCE=gcs requiere AGENT_DOCS_BUCKET")
+        if self.agent_docs_source == "folder":
+            mixed = [name for name, value in (
+                ("AGENT_DOCS_BUCKET", self.agent_docs_bucket),
+                ("AGENT_DOCS_PREFIX", self.agent_docs_prefix.strip()),
+                ("GCP_PROJECT", self.gcp_project),
+            ) if value]
+            if mixed:
+                raise ValueError(
+                    f"AGENT_DOCS_SOURCE=folder no usa {', '.join(mixed)}: vacíalas, o usa AGENT_DOCS_SOURCE=gcs"
+                )
+        return self
 
     @property
     def agent_docs_dir_path(self) -> Path:

@@ -23,7 +23,7 @@ def get_provider() -> AgentProvider:
 
 def provider_status() -> dict:
     base = {"provider": settings.agent_provider, "model": settings.agent_model, "execution": settings.agent_execution,
-            "auto_refine": settings.agent_auto_refine}
+            "auto_refine": settings.agent_auto_refine, "docs_source": settings.agent_docs_source}
     try:
         provider = get_provider()
     except AgentNotConfigured as exc:

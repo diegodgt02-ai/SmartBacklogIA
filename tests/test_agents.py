@@ -247,3 +247,79 @@ def test_web_generate_requires_one_source(demo, agents):
     res = demo.post("/p/DEMO/agents/generate", data={"filename": "", "document_text": ""}, follow_redirects=False)
     assert res.status_code == 303
     assert len(demo.get("/api/v1/projects/DEMO/stories").json()) == 2
+
+
+# ---------- generación desde todos los documentos (agente de documentos como AgentTool) ----------
+
+def generate_from_docs(client, **body):
+    return client.post("/api/v1/projects/DEMO/agents/generate-stories/from-documents", json=body)
+
+
+def test_generates_from_all_folder_documents_and_is_idempotent(demo, agents):
+    (agents / "DEMO").mkdir()
+    (agents / "DEMO" / "proceso.bpmn").write_text(BPMN, encoding="utf-8")
+    (agents / "DEMO" / "reunion.md").write_text("# Pagos\n## Requisitos\n- Enviar comprobante por correo\n", encoding="utf-8")
+    login(demo, "po@demo.co")
+
+    first = generate_from_docs(demo)
+    assert first.status_code == 202, first.text
+    run = first.json()
+    assert run["status"] == "succeeded", run
+    assert run["result"]["documents_read"] == ["proceso.bpmn", "reunion.md"]
+    assert len(run["result"]["created"]) == 3 and run["input_chars"] > 0
+    stories = {s["title"]: s for s in demo.get("/api/v1/projects/DEMO/stories").json()}
+    assert stories["Enviar comprobante por correo"]["source_ref"] == "reunion.md · Requisitos"
+    assert stories["Validar tarjeta"]["source_ref"] == "proceso.bpmn · Actividad: Validar tarjeta"
+    assert {s["status"] for s in stories.values() if s["code"] in run["result"]["created"]} == {"borrador"}
+
+    second = generate_from_docs(demo, instructions="Enfocarse en pagos").json()
+    assert second["result"]["created"] == [] and len(second["result"]["updated"]) == 3
+    # El mismo documento por la vía de un solo archivo usa la misma clave: no duplica.
+    single = generate(demo, filename="reunion.md").json()
+    assert single["result"]["created"] == []
+    assert len(demo.get("/api/v1/projects/DEMO/stories").json()) == 5
+
+
+def test_generate_from_documents_rules(demo, agents, monkeypatch):
+    login(demo, "po@demo.co")
+    res = generate_from_docs(demo)
+    assert res.status_code == 422 and "No hay documentos" in res.json()["detail"]
+
+    (agents / "DEMO").mkdir()
+    (agents / "DEMO" / "reunion.md").write_text("# Pagos\n- Validar tarjeta del cliente\n", encoding="utf-8")
+    for user in ("dev@demo.co", "stake@demo.co"):
+        login(demo, user)
+        assert generate_from_docs(demo).status_code == 403
+
+    login(demo, "po@demo.co")
+    monkeypatch.setattr(settings, "agent_provider", "none")
+    assert generate_from_docs(demo).status_code == 503
+
+
+def test_generate_from_documents_failure_creates_no_stories(demo, agents, monkeypatch):
+    (agents / "DEMO").mkdir()
+    (agents / "DEMO" / "reunion.md").write_text("# Pagos\n- Validar tarjeta del cliente\n", encoding="utf-8")
+
+    def boom(self, data, tools):
+        raise RuntimeError("fallo simulado")
+
+    monkeypatch.setattr(StubProvider, "generate_from_documents", boom)
+    login(demo, "po@demo.co")
+    run = generate_from_docs(demo).json()
+    assert run["status"] == "failed" and "fallo simulado" in run["error"]
+    assert len(demo.get("/api/v1/projects/DEMO/stories").json()) == 2
+
+
+def test_web_generate_from_documents_form(demo, agents):
+    (agents / "DEMO").mkdir()
+    (agents / "DEMO" / "reunion.md").write_text("# Pagos\n- Validar tarjeta del cliente\n", encoding="utf-8")
+    web_login(demo, "po@demo.co")
+    page = demo.get("/p/DEMO/agents").text
+    assert "Generar HU desde todos los documentos" in page
+    assert "Documentos · Carpeta local" in page and str(agents / "DEMO") in page
+
+    res = demo.post("/p/DEMO/agents/generate-from-documents", data={"instructions": ""}, follow_redirects=False)
+    assert res.status_code == 303
+    page = demo.get("/p/DEMO/agents").text
+    assert "Generar HU (documentos)" in page and "leídos reunion.md" in page
+    assert demo.get("/api/v1/projects/DEMO/stories/DEMO-3").json()["title"] == "Validar tarjeta del cliente"

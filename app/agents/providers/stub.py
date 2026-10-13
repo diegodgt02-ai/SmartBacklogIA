@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from app.agents.ports import (
+    DocumentGenerationInput,
     EstimationInput,
     EstimationOutput,
     GeneratedStory,
@@ -72,6 +73,29 @@ class StubProvider:
                     source_section=section or None,
                 ))
         return GenerationOutput(stories=stories), Usage(model=self.model)
+
+    def generate_from_documents(self, data: DocumentGenerationInput, tools) -> tuple[GenerationOutput, Usage]:
+        """Sin LLM: usa las mismas herramientas que el agente de documentos y lee todo, en orden."""
+        listing = tools.listar_documentos()
+        if listing["status"] != "ok":
+            raise RuntimeError(listing["mensaje"])
+        stories: list[GeneratedStory] = []
+        for doc in listing["documentos"]:
+            parts, start = [], 0
+            while start is not None:
+                chunk = tools.leer_documento(doc["nombre"], desde_caracter=start)
+                if chunk["status"] != "ok":
+                    break
+                parts.append(chunk["texto"])
+                start = chunk.get("continuar_desde")
+            if not parts:
+                continue
+            output, _ = self.generate_stories(GenerationInput(
+                project_key=data.project_key, project_name=data.project_name,
+                source_name=doc["nombre"], text="".join(parts), instructions=data.instructions,
+            ))
+            stories += [s.model_copy(update={"source_document": doc["nombre"]}) for s in output.stories]
+        return GenerationOutput(stories=stories[:200]), Usage(model=self.model)
 
     def refine_story(self, data: RefinementInput) -> tuple[RefinementOutput, Usage]:
         current = data.story.get("acceptance_criteria") or ""

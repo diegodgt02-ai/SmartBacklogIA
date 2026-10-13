@@ -184,7 +184,7 @@ class AgentRun(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     story_id: Mapped[int | None] = mapped_column(ForeignKey("user_stories.id", ondelete="SET NULL"))
-    kind: Mapped[str] = mapped_column(String(24))  # generate_stories | refine_story
+    kind: Mapped[str] = mapped_column(String(24))  # generate_stories | generate_from_docs | refine_story | estimate_story
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     provider: Mapped[str] = mapped_column(String(32))
     model: Mapped[str | None] = mapped_column(String(120))

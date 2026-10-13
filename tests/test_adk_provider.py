@@ -169,3 +169,82 @@ def test_estimation_schema_has_no_length_constraints():
     text = _json.dumps(_LlmEstimationOutput.model_json_schema())
     for forbidden in ("minimum", "maximum", "minLength", "maxLength", "pattern"):
         assert forbidden not in text
+
+
+class ScriptedGemini(BaseLlm):
+    """Imita a Gemini con herramientas: el generador consulta a agente_documentos (AgentTool),
+    que lista y lee la carpeta; luego el generador responde con set_model_response.
+
+    Cada llamada reporta 10/5 tokens, para comprobar que se suman también las del agente anidado.
+    """
+
+    model: str = "fake-gemini-pro"
+    calls: list = []
+
+    @staticmethod
+    def _responses(llm_request) -> list[dict]:
+        return [
+            part.function_response.response
+            for content in llm_request.contents
+            for part in (content.parts or [])
+            if part.function_response
+        ]
+
+    @staticmethod
+    def _call(name: str, args: dict) -> LlmResponse:
+        return LlmResponse(content=types.Content(role="model", parts=[
+            types.Part(function_call=types.FunctionCall(name=name, args=args))
+        ]))
+
+    async def generate_content_async(self, llm_request, stream=False):
+        tools = set(llm_request.tools_dict)
+        done = self._responses(llm_request)
+        if "agente_documentos" in tools:
+            self.calls.append(("generador", len(done)))
+            if not done:
+                response = self._call("agente_documentos", {"request": "¿Qué documentos hay y qué dicen?"})
+            else:
+                assert "Validar tarjeta" in str(done[0])  # el generador recibe lo que leyó el agente
+                response = self._call("set_model_response", {"stories": [
+                    {**GENERATION_JSON["stories"][0], "source_document": "reunion.md"}
+                ]})
+        else:
+            assert {"listar_documentos", "leer_documento"} <= tools
+            self.calls.append(("documentos", len(done)))
+            if not done:
+                response = self._call("listar_documentos", {})
+            elif len(done) == 1:
+                assert done[0]["documentos"][0]["nombre"] == "reunion.md"
+                response = self._call("leer_documento", {"nombre": "reunion.md"})
+            else:
+                response = LlmResponse(content=types.Content(role="model", parts=[
+                    types.Part(text=f"reunion.md dice: {done[1]['texto']}")
+                ]))
+        response.usage_metadata = types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=10, candidates_token_count=5,
+        )
+        response.turn_complete = True
+        yield response
+
+
+def test_generate_from_documents_uses_document_agent_as_agent_tool(tmp_path):
+    from app.agents.document_tools import make_document_tools
+    from app.agents.ports import DocumentGenerationInput
+    from app.services.documents import FolderSource
+
+    (tmp_path / "PAGO").mkdir()
+    (tmp_path / "PAGO" / "reunion.md").write_text("# Pagos\n- Validar tarjeta del cliente\n", encoding="utf-8")
+    tools = make_document_tools(FolderSource(tmp_path, "PAGO"), max_total_chars=10_000)
+    fake = ScriptedGemini(calls=[])
+    provider = AdkProvider(model="gemini-2.5-pro", api_key="clave-falsa-de-prueba", llm=fake)
+
+    output, usage = provider.generate_from_documents(
+        DocumentGenerationInput(project_key="PAGO", project_name="Pagos"), tools
+    )
+
+    assert [s.title for s in output.stories] == ["Pagar con tarjeta"]
+    assert output.stories[0].source_document == "reunion.md"
+    assert tools.documents_read == ["reunion.md"]
+    assert fake.calls == [("generador", 0), ("documentos", 0), ("documentos", 1), ("documentos", 2), ("generador", 1)]
+    # 5 llamadas al modelo: 2 del generador + 3 del agente anidado.
+    assert (usage.tokens_in, usage.tokens_out) == (50, 25)
