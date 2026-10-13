@@ -9,7 +9,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import models  # noqa: F401  (registra modelos en Base.metadata)
 from app.config import settings
 from app.db import Base, engine
-from app.routers import adk, admin, agents, auth, projects, stories, ui
+from app.routers import adk, admin, agents, auth, context, finops, projects, stories, ui
 from app.routers.ui import LoginRequired, render
 from app.services.errors import AppError
 
@@ -42,6 +42,8 @@ app.include_router(projects.router)
 app.include_router(stories.router)
 app.include_router(adk.router)
 app.include_router(agents.router)
+app.include_router(finops.router)
+app.include_router(context.router)
 app.include_router(ui.router)
 
 

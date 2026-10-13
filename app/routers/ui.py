@@ -11,15 +11,23 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import ApiKey, Project, User
 from app.agents.registry import provider_status
-from app.agents.runner import start_estimation, start_generation, start_generation_from_documents, start_refinement
+from app.agents.runner import (
+    start_backlog_sizing,
+    start_context_extraction,
+    start_generation,
+    start_generation_from_documents,
+    start_refinement,
+    start_sizing,
+)
 from app.config import settings
 from app.models import AgentRun
 from app.routers.auth import authenticate
+from app.routers.finops import project_finops
 from app.security import generate_api_key, hash_api_key, hash_password
-from app.services import estimation
 from app.services import projects as project_service
 from app.services import stories as story_service
 from app.services import audit
+from app.services import context as context_service
 from app.services.access import Principal, actor_for, load_project, project_role, require_member
 from app.services.documents import SOURCE_LABELS, get_document_source, load_document_text
 from app.services.errors import AppError, Forbidden, PayloadTooLarge
@@ -80,29 +88,8 @@ def _documents(project: Project) -> dict:
         return {"documents": [], "docs_location": "", "docs_label": label, "docs_error": exc.message}
 
 
-def _float(raw: str) -> float | None:
-    return float(raw) if raw.strip() else None
-
-
 def _int(raw: str) -> int | None:
     return int(raw) if raw.strip() else None
-
-
-def _factors_from_form(form: dict[str, str], story_type: str | None) -> dict | None:
-    """Factores 1–5 del tipo elegido. Ninguno → None (no se recalcula). Parcial → error de validación."""
-    if story_type not in ("HU_IA", "HU_TRADICIONAL"):
-        return None
-    names = estimation.WEIGHTS_BY_METHOD[estimation.METHOD_BY_TYPE[story_type]]
-    raw = {n: form.get(f"f_{n}", "").strip() for n in names}
-    if not any(raw.values()):
-        return None
-    missing = [n for n, v in raw.items() if not v]
-    if missing:
-        raise AppError(f"Completa todos los factores del método: faltan {', '.join(missing)}")
-    try:
-        return {n: int(v) for n, v in raw.items()}
-    except ValueError as exc:
-        raise AppError("Los factores deben ser enteros de 1 a 5") from exc
 
 
 def _project_for(db: Session, key: str, user: User, write: bool = False):
@@ -216,7 +203,7 @@ def approve_stage(
 
 SORTERS = {
     "priority": lambda s: (s.priority_rank is None, s.priority_rank or 0, s.id),
-    "points": lambda s: -(s.estimate_points or 0),
+    "function_points": lambda s: -(s.function_points or 0),
     "status": lambda s: (list(STATUS_LABELS).index(s.status), s.id),
     "title": lambda s: s.title.lower(),
 }
@@ -321,23 +308,15 @@ def story_detail(key: str, code: str, request: Request, user: User = Depends(cur
 def edit_story(
     key: str, code: str, request: Request,
     title: str = Form(""), epic: str = Form(""), role_: str = Form(""), need: str = Form(""), benefit: str = Form(""),
-    criteria: str = Form(""), type: str = Form(""), type_justification: str = Form(""), estimate_points: str = Form(""),
-    estimate_method: str = Form(""), priority_rank: str = Form(""), priority_method: str = Form(""), source_ref: str = Form(""),
+    criteria: str = Form(""), type: str = Form(""), type_justification: str = Form(""),
+    priority_rank: str = Form(""), priority_method: str = Form(""), source_ref: str = Form(""),
     user: User = Depends(current_user), db: Session = Depends(get_db),
-    f_datos: str = Form(""), f_modelo: str = Form(""), f_evaluacion: str = Form(""), f_riesgo: str = Form(""),
-    f_integracion: str = Form(""), f_complejidad: str = Form(""), f_esfuerzo: str = Form(""), f_incertidumbre: str = Form(""),
 ):
     try:
         project, role = _project_for(db, key, user, write=True)
         if role == "developer" and not user.is_admin:
             raise Forbidden("Los developers no editan la definición de la HU")
         story = story_service.get_story(db, project, code)
-        factors = _factors_from_form(
-            {"f_datos": f_datos, "f_modelo": f_modelo, "f_evaluacion": f_evaluacion, "f_riesgo": f_riesgo,
-             "f_integracion": f_integracion, "f_complejidad": f_complejidad, "f_esfuerzo": f_esfuerzo,
-             "f_incertidumbre": f_incertidumbre},
-            _opt(type) or story.type,
-        )
         data = {
             "title": title.strip(),
             "epic": _opt(epic),
@@ -347,25 +326,18 @@ def edit_story(
             "acceptance_criteria": _opt(criteria),
             "type": _opt(type),
             "type_justification": _opt(type_justification),
-            "estimate_points": _float(estimate_points),
-            "estimate_method": _opt(estimate_method),
             "priority_rank": _int(priority_rank),
             "priority_method": _opt(priority_method),
             "source_ref": _opt(source_ref),
         }
         if len(data["title"]) < 3:
             raise AppError("El título debe tener al menos 3 caracteres")
-        if factors is not None:
-            # Con factores, el servidor calcula puntos y método; el campo manual se ignora.
-            data.pop("estimate_points")
-            data.pop("estimate_method")
-            data["estimate_factors"] = factors
         story_service.apply_changes(db, project, story, data, _actor(user, role))
         db.commit()
         flash(request, "HU actualizada")
     except ValueError:
         db.rollback()
-        flash(request, "Puntos y prioridad deben ser números", "error")
+        flash(request, "La prioridad debe ser un número", "error")
     except AppError as exc:
         db.rollback()
         flash(request, exc.message, "error")
@@ -421,9 +393,9 @@ def reports(key: str, request: Request, user: User = Depends(current_user), db: 
     summary = project_service.summary(db, project)
     db.commit()
     return render(
-        request, "reports.html", user, project=project, role=role, summary=summary,
-        status_chart=[[v["label"], v["count"]] for v in summary["by_status"].values()],
-        epic_chart=[[k, v["points"]] for k, v in summary["by_epic"].items()],
+        request, "reports.html", user, project=project, role=role, summary=summary, finops=project_finops(project),
+        context=context_service.overview(db, project),
+        can_write=role in ("product_owner", "scrum_master") or user.is_admin, agent_status=provider_status(),
     )
 
 
@@ -588,20 +560,88 @@ def generate_from_documents_submit(
     return redirect(f"/p/{key}/agents")
 
 
-@router.post("/p/{key}/stories/{code}/agents/estimate")
-def estimate_submit(
+@router.post("/p/{key}/stories/{code}/agents/size")
+def size_submit(
     key: str, code: str, request: Request, background: BackgroundTasks,
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ):
     try:
         project, _role = _project_for(db, key, user, write=True)
         story = story_service.get_story(db, project, code)
-        run = start_estimation(db, project, story, user_id=user.id, instructions=None, background=background)
+        run = start_sizing(db, project, story, user_id=user.id, instructions=None, background=background)
         flash(request, _agent_message(run), "ok" if run.status != "failed" else "error")
     except AppError as exc:
         db.rollback()
         flash(request, exc.message, "error")
     return redirect(f"/p/{key}/stories/{code}")
+
+
+@router.post("/p/{key}/agents/extract-context")
+def extract_context_submit(
+    key: str, request: Request, background: BackgroundTasks,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    try:
+        project, _role = _project_for(db, key, user, write=True)
+        run = start_context_extraction(db, project, user_id=user.id, instructions=None, background=background)
+        flash(request, _agent_message(run), "ok" if run.status != "failed" else "error")
+    except AppError as exc:
+        db.rollback()
+        flash(request, exc.message, "error")
+    return redirect(f"/p/{key}/reports")
+
+
+@router.post("/p/{key}/context/{decision}")
+def review_context_submit(
+    key: str, decision: str, request: Request, notes: str = Form(""),
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    try:
+        project, _role = _project_for(db, key, user, write=True)
+        if decision not in ("approve", "reject"):
+            raise AppError("Decisión inválida")
+        review = context_service.approve if decision == "approve" else context_service.reject
+        graph = review(db, project, user, _opt(notes))
+        db.commit()
+        flash(request, f"Grafo de contexto v{graph.version}: {'aprobado' if decision == 'approve' else 'rechazado'}")
+    except AppError as exc:
+        db.rollback()
+        flash(request, exc.message, "error")
+    return redirect(f"/p/{key}/reports")
+
+
+@router.post("/p/{key}/stories/{code}/violations/{constraint_id}/waive")
+def waive_submit(
+    key: str, code: str, constraint_id: str, request: Request, justification: str = Form(""),
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    try:
+        project, role = _project_for(db, key, user, write=True)
+        story = story_service.get_story(db, project, code)
+        story_service.waive_violation(db, story, constraint_id, _actor(user, role), justification)
+        db.commit()
+        flash(request, f"Excepción registrada para {constraint_id}")
+    except AppError as exc:
+        db.rollback()
+        flash(request, exc.message, "error")
+    return redirect(f"/p/{key}/stories/{code}")
+
+
+@router.post("/p/{key}/agents/size-backlog")
+def size_backlog_submit(
+    key: str, request: Request, background: BackgroundTasks, resize: str = Form(""),
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+):
+    try:
+        project, _role = _project_for(db, key, user, write=True)
+        run = start_backlog_sizing(
+            db, project, resize=bool(resize), user_id=user.id, instructions=None, background=background,
+        )
+        flash(request, _agent_message(run), "ok" if run.status != "failed" else "error")
+    except AppError as exc:
+        db.rollback()
+        flash(request, exc.message, "error")
+    return redirect(f"/p/{key}/reports")
 
 
 @router.post("/p/{key}/stories/{code}/agents/refine")

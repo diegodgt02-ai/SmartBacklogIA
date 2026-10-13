@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
 
 EXPORT_COLUMNS = [
     "code", "epic", "title", "role", "need", "benefit", "acceptance_criteria",
-    "type", "status", "estimate_points", "priority_rank", "assignee", "source_ref",
+    "type", "status", "function_points", "nfr_points", "priority_rank", "assignee", "source_ref",
 ]
 
 

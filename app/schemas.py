@@ -18,9 +18,9 @@ class StoryIn(BaseModel):
     acceptance_criteria: str | None = Field(None, max_length=20000, description="Criterios en markdown (checklist o Gherkin)")
     type: StoryType | None = None
     type_justification: str | None = None
-    estimate_points: float | None = None
-    estimate_method: str | None = None
-    estimate_factors: dict | None = None
+    fp_components: list[dict] | None = Field(
+        None, description="Funciones IFPUG: [{name, type: ILF|EIF|EI|EO|EQ, det, ret|ftr, reused}]; el servidor calcula los puntos"
+    )
     priority_rank: int | None = None
     priority_method: str | None = None
     source_ref: str | None = None
@@ -36,9 +36,9 @@ class StoryPatch(BaseModel):
     acceptance_criteria: str | None = Field(None, max_length=20000)
     type: StoryType | None = None
     type_justification: str | None = None
-    estimate_points: float | None = None
-    estimate_method: str | None = None
-    estimate_factors: dict | None = None
+    fp_components: list[dict] | None = Field(
+        None, description="Funciones IFPUG: [{name, type: ILF|EIF|EI|EO|EQ, det, ret|ftr, reused}]; el servidor calcula los puntos"
+    )
     priority_rank: int | None = None
     priority_method: str | None = None
     source_ref: str | None = None
@@ -154,9 +154,12 @@ def story_out(s: UserStory) -> dict:
         "type": s.type,
         "type_justification": s.type_justification,
         "status": s.status,
-        "estimate_points": s.estimate_points,
-        "estimate_method": s.estimate_method,
-        "estimate_factors": s.estimate_factors,
+        "function_points": s.function_points,
+        "fp_analysis": s.fp_analysis,
+        "nfr_points": s.nfr_points,
+        "context_analysis": s.context_analysis,
+        "open_violations": [v["constraint_id"] for v in (s.context_analysis or {}).get("violations", [])
+                            if v.get("status") == "open"],
         "priority_rank": s.priority_rank,
         "priority_method": s.priority_method,
         "assignee": {"id": s.assignee.id, "name": s.assignee.name, "email": s.assignee.email} if s.assignee else None,

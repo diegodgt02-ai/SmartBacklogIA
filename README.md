@@ -1,55 +1,223 @@
 # Smart Product Backlog — MVP
 
 Plataforma de gestión de historias de usuario (HU) para el Smart Product Backlog del curso.
-Los agentes ADK hacen la IA (generar, clasificar, estimar, refinar) y se conectan a esta API.
-**Este MVP no llama a ningún LLM.**
+La IA la hacen agentes Google ADK: agentes externos que se conectan a esta API, o los agentes embebidos
+(Gemini) que generan, refinan y dimensionan HU (sección 4). Sin agentes configurados (`AGENT_PROVIDER=none`)
+la plataforma funciona igual y no llama a ningún LLM.
 
 Incluye:
 
 - Login, roles por proyecto y administración de usuarios y API keys.
 - Proyectos, épicas, HU con estado, asignación, auditoría y reportes (CSV/JSON).
 - Validación HITL obligatoria por etapa (1–5): no se aprueba una etapa sin aprobar la anterior.
+- Dimensionamiento con puntos de función, tamaño no funcional por restricciones (seguridad, privacidad, rendimiento...)
+  con un grafo de contexto aprobado por una persona, y proyección FinOps del costo de generar el backlog con IA (sección 3.2.1).
+- Documentos de entrada desde una carpeta local **o** un bucket de Cloud Storage (sección 1.2).
 - API para que ADK cree proyectos, usuarios, HU y asignaciones, y para el ciclo de refinamiento.
 - UI web: dashboard con pipeline, backlog jerárquico, tablero Kanban, detalle de HU, reportes y miembros.
 
 ---
 
-## 1. Levantar con Docker Compose
+## 1. Puesta en marcha
 
-Requisito: Docker con el plugin `compose`.
+### 1.1 Requisitos
+
+| Para | Necesitas |
+|---|---|
+| Correr con Docker (recomendado) | Docker con el plugin `compose` |
+| Correr sin Docker | Python 3.12 y un Postgres (puede ser el de `docker compose up -d db`) |
+| Agentes con Gemini (opcional) | Una API key de Gemini (Google AI Studio). Ver sección 4.5 |
+| Documentos en un bucket (opcional) | Un bucket de Cloud Storage, `gcloud` instalado y una identidad con permiso de lectura sobre el bucket |
+
+Todo se ejecuta desde la carpeta del proyecto (donde está `docker-compose.yml`). La configuración vive en `.env`:
 
 ```bash
-cd "Proyecto final/prueba_mcp"
-cp .env.example .env                              # opcional: cambia SESSION_SECRET
-docker compose up --build -d                      # levanta Postgres y la app
-docker compose exec app python scripts/seed.py    # una sola vez: admin + proyecto SPB de demo
+cd SmartBacklogIA
+cp .env.example .env      # luego edita .env: como mínimo SESSION_SECRET
 ```
+
+### 1.2 Elegir la fuente de documentos: carpeta local **o** bucket
+
+Los agentes leen los documentos de los proyectos (BPMN, PDF, MD, TXT) de **una sola** fuente. Se elige con
+`AGENT_DOCS_SOURCE` y no se pueden mezclar: si `.env` combina variables de las dos, la app no arranca y dice cuál sobra.
+
+| | Carpeta local (`folder`, por defecto) | Bucket (`gcs`) |
+|---|---|---|
+| Dónde van los archivos | `documents/<CLAVE>/archivo` | `gs://<bucket>/<prefijo>/<CLAVE>/archivo` |
+| Variables en `.env` | `AGENT_DOCS_SOURCE=folder` y nada más del bucket | `AGENT_DOCS_SOURCE=gcs`, `AGENT_DOCS_BUCKET` (obligatoria), `AGENT_DOCS_PREFIX` y `GCP_PROJECT` (opcionales) |
+| Deben quedar **vacías** | `AGENT_DOCS_BUCKET`, `AGENT_DOCS_PREFIX`, `GCP_PROJECT` | — (`AGENT_DOCS_DIR` se ignora) |
+| Credenciales | Ninguna | Application Default Credentials o una cuenta de servicio con `roles/storage.objectViewer` |
+| Ejemplo incluido | `documents/PAGO/` (BPMN y reunión) | Súbelo con `gcloud storage cp` (sección 1.4, paso 3) |
+
+`<CLAVE>` es la clave del proyecto en mayúsculas (`PAGO`). Un proyecto solo ve su propia carpeta. Detalle de formatos
+y reglas: secciones 4.2 y 4.3.
+
+### 1.3 Opción A: Docker + carpeta local
+
+1. **`.env`** (lo que no aparece queda con el valor de `.env.example`):
+   ```
+   SESSION_SECRET=un-valor-largo-y-aleatorio
+   AGENT_DOCS_SOURCE=folder
+   AGENT_DOCS_BUCKET=
+   AGENT_DOCS_PREFIX=
+   GCP_PROJECT=
+   # Agentes: stub = sin LLM (para probar el flujo); adk = Gemini
+   AGENT_PROVIDER=stub
+   ```
+2. **Documentos:** ponlos en `documents/<CLAVE>/`. El ejemplo `documents/PAGO/` ya existe. Docker monta `./documents`
+   en `/data/documents` (solo lectura); no hace falta reconstruir al agregar archivos.
+3. **Levantar y cargar datos de demo:**
+   ```bash
+   docker compose up --build -d                      # Postgres + app; aplica las migraciones al arrancar
+   docker compose exec app python scripts/seed.py    # una sola vez: admin + proyecto SPB de demo
+   ```
+4. **Verificar:** sección 1.6.
+
+### 1.4 Opción B: Docker + bucket de Cloud Storage
+
+1. **Bucket y permisos** (una vez; con tu cuenta de GCP):
+   ```bash
+   gcloud auth login
+   gcloud storage buckets create gs://mi-bucket-spb --project=mi-proyecto --location=us-central1   # si no existe
+   # La identidad con la que corre la app solo necesita leer:
+   gcloud storage buckets add-iam-policy-binding gs://mi-bucket-spb \
+     --member="user:tu-correo@empresa.com" --role="roles/storage.objectViewer"
+   ```
+   Para subir archivos (paso 3) tu usuario necesita además permiso de escritura (`roles/storage.objectCreator`).
+2. **`.env`:**
+   ```
+   SESSION_SECRET=un-valor-largo-y-aleatorio
+   AGENT_DOCS_SOURCE=gcs
+   AGENT_DOCS_BUCKET=mi-bucket-spb
+   AGENT_DOCS_PREFIX=spb            # opcional; vacío = raíz del bucket
+   GCP_PROJECT=mi-proyecto          # opcional; si no, el de las credenciales
+   AGENT_PROVIDER=stub
+   ```
+3. **Subir los documentos** con la misma estructura que la carpeta (`<prefijo>/<CLAVE>/archivo`):
+   ```bash
+   gcloud storage cp documents/PAGO/* gs://mi-bucket-spb/spb/PAGO/
+   gcloud storage ls gs://mi-bucket-spb/spb/PAGO/
+   ```
+   Solo cuentan los archivos directos de `<CLAVE>/`: las subcarpetas se ignoran.
+4. **Credenciales para el contenedor.** Elige una:
+   - **Tu usuario (desarrollo):**
+     ```bash
+     gcloud auth application-default login
+     gcloud auth application-default set-quota-project mi-proyecto   # si gcloud lo pide
+     ```
+     y en `docker-compose.yml` descomenta, en el servicio `app`, el volumen
+     `- ~/.config/gcloud:/root/.config/gcloud:ro`.
+   - **Cuenta de servicio (servidor):** crea una clave JSON de una cuenta de servicio con `roles/storage.objectViewer`
+     sobre el bucket, móntala en el servicio `app` (por ejemplo `- ./secrets/gcp-sa.json:/run/secrets/gcp-sa.json:ro`)
+     y agrega a `.env`:
+     ```
+     GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp-sa.json
+     ```
+     No subas la clave al repositorio (`secrets/` debe estar en `.gitignore`).
+5. **Levantar y cargar datos de demo:**
+   ```bash
+   docker compose up --build -d
+   docker compose exec app python scripts/seed.py
+   ```
+   La carpeta `./documents` sigue montada, pero con `gcs` la app no la lee.
+6. **Verificar:** sección 1.6. Si la app no puede leer el bucket, la API responde `503` con el motivo y las pantallas
+   lo muestran; el resto de la plataforma sigue funcionando.
+
+### 1.5 Sin Docker
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+docker compose up -d db                              # o tu propio Postgres
+```
+
+En `.env` cambia la base al puerto que publica Docker (`5433`) y elige la fuente como en 1.3 o 1.4:
+
+```
+DATABASE_URL=postgresql+psycopg://spb:spb@localhost:5433/spb
+AGENT_DOCS_SOURCE=folder          # o gcs, con sus variables
+AGENT_DOCS_DIR=documents          # solo folder; ruta relativa a esta carpeta
+```
+
+```bash
+.venv/bin/alembic upgrade head
+.venv/bin/python scripts/seed.py
+.venv/bin/uvicorn app.main:app --reload
+```
+
+- Ejecuta los comandos **desde la carpeta del proyecto**: la app lee `.env` de la carpeta actual.
+- Con `gcs` y tu usuario basta `gcloud auth application-default login`. Con cuenta de servicio, `GOOGLE_APPLICATION_CREDENTIALS`
+  debe estar en el **entorno del proceso** (`export GOOGLE_APPLICATION_CREDENTIALS=/ruta/clave.json` antes de `uvicorn`):
+  la app lee `.env` para su configuración, pero no lo copia al entorno, y la librería de Google solo mira el entorno.
+  En Docker no hace falta porque `env_file` sí lo pone en el entorno del contenedor.
+
+### 1.6 Verificar que todo funciona
+
+Abre http://localhost:8000/login (usuarios en la tabla de abajo) y Swagger en http://localhost:8000/docs.
+Desde la terminal:
+
+```bash
+B=http://localhost:8000
+curl -s -c cookies.txt -H 'Content-Type: application/json' \
+  -d '{"email":"admin@spb.local","password":"cambiar-me-ya"}' $B/api/v1/auth/login
+
+curl -s -b cookies.txt $B/api/v1/agents/status
+# → "configured": true, "provider": "stub" | "adk", "docs_source": "folder" | "gcs"
+
+# Los documentos de ejemplo son del proyecto PAGO: créalo (el admin queda como product owner)
+curl -s -b cookies.txt -H 'Content-Type: application/json' \
+  -d '{"key":"PAGO","name":"Pagos en línea"}' $B/api/v1/projects
+
+curl -s -b cookies.txt $B/api/v1/projects/PAGO/agents/documents
+# → "source": "folder" con la ruta de documents/PAGO, o "gcs" con gs://mi-bucket-spb/spb/PAGO/
+```
+
+Flujo completo con los agentes (con `AGENT_PROVIDER=stub` no gasta cuota; con `adk` usa Gemini):
+
+```bash
+# 1. Generar HU desde todos los documentos del proyecto (agente de documentos como AgentTool)
+curl -s -b cookies.txt -H 'Content-Type: application/json' -d '{}' \
+  $B/api/v1/projects/PAGO/agents/generate-stories/from-documents
+# 2. Extraer el grafo de contexto (funcionalidades, entidades, restricciones) y revisarlo
+curl -s -b cookies.txt -H 'Content-Type: application/json' -d '{}' $B/api/v1/projects/PAGO/agents/extract-context
+curl -s -b cookies.txt $B/api/v1/projects/PAGO/context            # revisa el borrador; corrígelo con PUT .../context/draft
+curl -s -b cookies.txt -H 'Content-Type: application/json' -d '{"notes":"Revisado"}' \
+  $B/api/v1/projects/PAGO/context/draft/approve                     # solo una persona
+# 3. Dimensionar el backlog: puntos de función + restricciones activadas/violadas del grafo aprobado
+curl -s -b cookies.txt -H 'Content-Type: application/json' -d '{}' $B/api/v1/projects/PAGO/agents/size-backlog
+# 4. Proyección FinOps (costo, impuesto de contexto, horas) con otro modelo y escenario
+curl -s -b cookies.txt "$B/api/v1/projects/PAGO/finops?model=claude-sonnet-5-5&scenario=high"
+```
+
+El paso 2 es opcional: sin grafo aprobado, el dimensionamiento mide solo puntos de función. Con grafo, una HU que
+viola una restricción bloquea la aprobación de la etapa 3 hasta que se corrija o se registre una excepción.
+
+Con `AGENT_EXECUTION=background` (por defecto) las respuestas `202` traen `"status": "queued"`; consulta el resultado
+con `GET /api/v1/agents/runs/{id}` o en la pantalla `/p/PAGO/agents`. El resultado del paso 3 también aparece en
+`/p/PAGO/reports`. Las etapas HITL (sección 2) las aprueba siempre una persona.
+
+### 1.7 Cambiar de fuente, reconstruir y reiniciar
+
+| Quiero | Hago |
+|---|---|
+| Pasar de carpeta a bucket | Opción B pasos 1–4 y `docker compose up -d app` (recrea el contenedor para leer `.env`) |
+| Volver a la carpeta | `AGENT_DOCS_SOURCE=folder` **y** vaciar `AGENT_DOCS_BUCKET`, `AGENT_DOCS_PREFIX` y `GCP_PROJECT`; luego `docker compose up -d app` |
+| Aplicar cambios de código | `docker compose up --build -d app` |
+| Empezar con la base vacía (por ejemplo, tras el cambio a puntos de función o al grafo de contexto) | `docker compose down -v`, `docker compose up --build -d` y de nuevo `seed.py` |
+
+Un contenedor que ya corre no ve los cambios de `.env`: recréalo con `docker compose up -d app`.
 
 | Servicio | Dirección | Notas |
 |---|---|---|
 | App (UI y API) | http://localhost:8000 | `/login` para la UI, `/docs` para Swagger |
 | Postgres | `localhost:5433` | usuario `spb`, clave `spb`, base `spb`. Puerto 5433 para no chocar con un Postgres local en 5432 |
 
-Al arrancar, el contenedor `app` aplica las migraciones (`alembic upgrade head`).
-
 Comandos útiles:
 
 ```bash
 docker compose ps                 # estado de los servicios
-docker compose logs -f app        # logs de la API
-docker compose up --build -d app  # reconstruir la app tras cambios de código
+docker compose logs -f app        # logs de la API (aquí aparece el motivo si la app no arranca)
 docker compose down               # parar; los datos quedan en el volumen pgdata
 docker compose down -v            # parar y borrar la base
-```
-
-Sin Docker:
-
-```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
-export DATABASE_URL=postgresql+psycopg://spb:spb@localhost:5433/spb
-.venv/bin/alembic upgrade head
-.venv/bin/python scripts/seed.py
-.venv/bin/uvicorn app.main:app --reload
 ```
 
 ### Usuarios de prueba (creados por el seed)
@@ -153,7 +321,10 @@ Es **idempotente**: si el `key` del proyecto ya existe, lo actualiza; si una HU 
           "acceptance_criteria": "- [ ] Muestra error si la tarjeta es rechazada\n- [ ] Permite reintentar hasta 3 veces",
           "type": "HU_TRADICIONAL",
           "type_justification": "Integración con pasarela",
-          "estimate_points": 5,
+          "fp_components": [
+            {"name": "Pago", "type": "ILF", "det": 12, "ret": 2},
+            {"name": "Pagar con tarjeta", "type": "EI", "det": 8, "ftr": 2}
+          ],
           "priority_rank": 1,
           "source_ref": "Reunión 12/09, min 4:10",
           "assignee_email": "luis.dev@empresa.co"
@@ -187,7 +358,7 @@ Es **idempotente**: si el `key` del proyecto ya existe, lo actualiza; si una HU 
 | `stories[].assignee_email` | no | Correo de un miembro del proyecto. Si no es miembro, responde `422` |
 | `stories[]` (raíz) | no | HU sin épica |
 
-Campos opcionales de HU: `role`, `need`, `benefit`, `acceptance_criteria` (**markdown**, máx. 20 000 caracteres; ver [sección 3.5), `type_justification`, `estimate_points` (número), `estimate_method`, `estimate_factors` (objeto), `priority_rank` (entero), `priority_method`, `source_ref`.
+Campos opcionales de HU: `role`, `need`, `benefit`, `acceptance_criteria` (**markdown**, máx. 20 000 caracteres; ver [sección 3.5), `type_justification`, `fp_components` (lista de funciones IFPUG; el servidor calcula `function_points`, ver sección 3.2.1), `priority_rank` (entero), `priority_method`, `source_ref`.
 
 **Response:**
 
@@ -321,16 +492,57 @@ Efecto: la HU pasa a `refinada`, su versión sube, la solicitud pasa a `complete
 | `409` | La HU ya no está en `en_refinamiento` |
 | `401` | API key inválida |
 
-### 3.2.1 Estimar una HU (etapa 3)
+### 3.2.1 Dimensionar (etapa 3): puntos de función + FinOps
 
-Método completo y justificación: [`docs/metodo-estimacion-hu-ia.md`](docs/metodo-estimacion-hu-ia.md).
+Reemplaza la estimación por story points. Método completo, fuentes verificadas, fórmulas y supuestos:
+[`docs/metodo-fpa-finops.md`](docs/metodo-fpa-finops.md).
 
-- **Por factores (recomendado):** `PATCH /api/v1/projects/{key}/stories/{code}` con `estimate_factors`. El servidor calcula `estimate_points`, `estimate_method` y el bloque completo (rango, spike, puntaje bruto). Factores válidos: enteros de 1 a 5.
-  - HU_IA: `{"datos": 4, "modelo": 3, "evaluacion": 3, "riesgo": 4, "integracion": 2}`
-  - HU_TRADICIONAL: `{"complejidad": 3, "esfuerzo": 4, "incertidumbre": 2}`
-  - Respuesta de error `422` si faltan o sobran factores, si un valor está fuera de 1–5, si la HU no tiene tipo, o si `estimate_method` no corresponde al tipo.
-- **Con agente:** `POST /api/v1/projects/{key}/stories/{code}/agents/estimate` (rol de escritura o API key de servicio). Responde `202` con un `AgentRun`. El agente puntúa factores; el servidor calcula los puntos. No cambia el estado de la HU.
-- **Manual:** `estimate_points` sin factores sigue funcionando.
+**Puntos de función (IFPUG sin ajustar).** Cada HU guarda `function_points` y `fp_analysis` (funciones con su complejidad y puntos).
+
+- **Con agentes:** `POST /api/v1/projects/{key}/stories/{code}/agents/size` (una HU) o `POST /api/v1/projects/{key}/agents/size-backlog` (todas las HU activas sin puntos, en orden de prioridad; `{"resize": true}` recalcula todas). Responden `202` con un `AgentRun`. Dos agentes ADK en secuencia: uno identifica conceptos (entidades y transacciones) y otro los clasifica como ILF/EIF/EI/EO/EQ con sus conteos; **el servidor calcula los puntos**. Una entidad que ya contó una HU anterior suma 0 (`reused`). No cambian el estado de la HU ni aprueban la etapa.
+- **Corrección humana (HITL):** `PATCH /api/v1/projects/{key}/stories/{code}` con `fp_components`:
+  ```json
+  {"fp_components": [
+    {"name": "Pago", "type": "ILF", "det": 12, "ret": 2},
+    {"name": "Cliente", "type": "ILF", "det": 8, "ret": 1, "reused": true},
+    {"name": "Registrar pago", "type": "EI", "det": 8, "ftr": 2},
+    {"name": "Comprobante", "type": "EO", "det": 10, "ftr": 2}
+  ]}
+  ```
+  `ILF`/`EIF` llevan `det` y `ret`; `EI`/`EO`/`EQ` llevan `det` y `ftr`. `422` si falta un conteo, un tipo no existe o un valor no es entero positivo. El cambio queda en el historial.
+
+**Contexto y restricciones (tamaño no funcional).** Los puntos de función no miden restricciones (seguridad, privacidad,
+rendimiento) y cada HU se mediría aislada. Por eso el proyecto tiene un **grafo de contexto**: funcionalidades y entidades
+(existentes o planificadas) y restricciones con categoría, severidad y regla.
+
+- **El agente propone, una persona aprueba:** `POST /api/v1/projects/{key}/agents/extract-context` lee los documentos
+  (carpeta o bucket) y guarda un **borrador**. `GET /api/v1/projects/{key}/context` lo muestra; `PUT .../context/draft`
+  lo corrige (o lo crea a mano); `POST .../context/draft/approve` o `.../reject` lo revisa. Solo una persona aprueba
+  (una API key de servicio recibe `403`). El dimensionamiento usa solo la última versión aprobada.
+- **Al dimensionar** con un grafo aprobado, un agente arquitecto corre primero e informa qué funcionalidades toca la HU,
+  qué entidades ya existen (suman 0 FP), qué restricciones activa y cuáles **viola**. El servidor descarta ids que no
+  existen y toma la severidad del grafo. Cada HU guarda `nfr_points` (baja 2, media 4, alta 7, crítica 10 por restricción)
+  y `context_analysis`; FinOps convierte los puntos NFR en iteraciones y tokens extra.
+- **Violaciones (HITL):** una HU que incumple una restricción **bloquea la aprobación de la etapa 3**. Se resuelve
+  cambiando la HU y volviendo a dimensionarla, o con una excepción justificada:
+  `POST /api/v1/projects/{key}/stories/{code}/violations/{constraint_id}/waive` con `{"justification": "..."}` (mín. 10
+  caracteres, solo personas). Todo queda en el historial.
+
+Formato de un nodo de restricción para `PUT .../context/draft`:
+
+```json
+{"id": "privacidad-datos", "kind": "constraint", "name": "Datos locales", "category": "privacidad",
+ "severity": "critica", "rule": "Los datos de usuarios no salen de servidores propios",
+ "keywords": ["perfil", "api externa"]}
+```
+
+**FinOps de generación autónoma** (sin LLM, calculado al vuelo con los puntos guardados):
+
+- `GET /api/v1/projects/{key}/finops`: por HU en orden de generación, la huella de contexto del repositorio antes de generarla, iteraciones, tokens de entrada/caché/salida, costo USD, **impuesto de contexto** (lo que cuesta de más por el repositorio acumulado) y horas; más totales, escenarios bajo/esperado/alto y media PERT. Parámetros opcionales: `model` (`claude-opus-5-5` por defecto, `claude-sonnet-5-5`, `claude-haiku-5-5`), `scenario` y cualquier supuesto (`loc_per_fp`, `context_read_ratio`, `cache_hit_ratio`, precios...); todos aparecen en Swagger.
+- `GET /api/v1/projects/{key}/finops/export?format=csv|json`.
+- `GET /api/v1/finops/models`: tabla de precios con fecha (`as_of`) y fuente.
+
+Los supuestos por defecto **no están calibrados**: úsalos como orden de magnitud y ajústalos con datos reales (sección 9 del método).
 
 ### 3.3 Otros endpoints útiles para ADK
 
@@ -396,7 +608,7 @@ La UI lo muestra renderizado con markdown **sin HTML**: si el texto trae etiquet
 
 ## 4. Agentes IA embebidos (ADK + Gemini)
 
-Los agentes viven dentro del backend, en `app/agents/`. Sirven para **generar HU desde documentos** y **refinar HU**. No necesitan MCP ni un servicio aparte. Los documentos se leen de **una sola fuente**: una carpeta local (por defecto) **o** un bucket de Cloud Storage (sección 4.3), nunca de ambas.
+Los agentes viven dentro del backend, en `app/agents/`. Sirven para **generar HU desde documentos**, **refinar HU** y **dimensionarlas con puntos de función** (sección 3.2.1). No necesitan MCP ni un servicio aparte. Los documentos se leen de **una sola fuente**: una carpeta local (por defecto) **o** un bucket de Cloud Storage (sección 4.3), nunca de ambas.
 
 ```
 app/agents/
@@ -481,6 +693,8 @@ Un proyecto solo ve su subcarpeta. Las rutas con `..`, nombres con carpetas y sy
 `GET /api/v1/projects/{key}/agents/documents` devuelve `source` (`folder` o `gcs`), `folder` (la ruta o `gs://...`) y `documents`.
 
 ### 4.3 Documentos en un bucket de Cloud Storage (opcional)
+
+Pasos para ponerlo en marcha (bucket, permisos, credenciales, Docker o local): sección 1.4. Aquí, las reglas.
 
 La fuente de documentos es **excluyente**: `AGENT_DOCS_SOURCE=folder` (por defecto) **o** `AGENT_DOCS_SOURCE=gcs`. Con `gcs` no se lee la carpeta local (aunque siga montada), y con `folder` no se consulta el bucket. La API, las pantallas, el agente de documentos y `scripts/try_agent.py` usan siempre la misma fuente; `GET /api/v1/agents/status` la informa en `docs_source`.
 
@@ -600,7 +814,8 @@ Dentro del contenedor, la carpeta de documentos está en `/data/documents`. El s
 
 ## 5. Configuración
 
-Variables (`.env` o entorno del contenedor):
+Variables (`.env` o entorno del contenedor). Pasos completos por modo: sección 1. En Docker, `docker-compose.yml` fija
+`DATABASE_URL` (`db:5432`) y `AGENT_DOCS_DIR` (`/data/documents`) para el contenedor y esos valores ganan sobre `.env`.
 
 | Variable | Por defecto | Uso |
 |---|---|---|
@@ -618,6 +833,7 @@ Variables (`.env` o entorno del contenedor):
 | `AGENT_DOCS_DIR` | `documents` | Solo `folder`. Carpeta raíz de documentos por proyecto (en Docker: `/data/documents`) |
 | `AGENT_DOCS_BUCKET` / `AGENT_DOCS_PREFIX` | vacío | Solo `gcs` (bucket obligatorio). `gs://BUCKET/PREFIX/<KEY>/`. Con `folder` deben quedar vacías |
 | `GCP_PROJECT` | vacío | Solo `gcs`, opcional. Proyecto de GCP del cliente de Storage |
+| `GOOGLE_APPLICATION_CREDENTIALS` | vacío | Solo `gcs` con cuenta de servicio: ruta al JSON **dentro del contenedor**. Sin Docker, expórtala en el shell (sección 1.5). Con `gcloud auth application-default login` no hace falta |
 | `AGENT_PRICE_IN_PER_1M` / `AGENT_PRICE_OUT_PER_1M` | vacío | Precio por millón de tokens; si no se definen, `cost_usd` queda vacío |
 
 ---
@@ -632,7 +848,7 @@ TEST_DATABASE_URL=postgresql+psycopg://spb:spb@localhost:5433/spb_test .venv/bin
 Para un caso: `pytest tests/test_api.py::test_refinement_cycle`.
 Con Postgres, crea antes la base `spb_test` (`docker compose exec db createdb -U spb spb_test`). Los tests borran sus datos después de cada caso; no uses la base de desarrollo.
 
-Cubren: fuente de documentos en bucket (cliente falso, sin red), agente de documentos como AgentTool (modelo falso), ingesta idempotente, ciclo de refinamiento con control de versión, permisos por rol, validación HITL, asignación por correo desde ADK, reportes y exportación, y las pantallas principales.
+Cubren: grafo de contexto (validación, ciclo borrador → aprobado, permisos), tamaño no funcional y violaciones (bloqueo de la etapa 3, excepciones, corrección de la HU), puntos de función (matrices IFPUG, reuso de entidades, corrección humana), modelo FinOps (cálculo a mano, impuesto de contexto, escenarios, ventana, precios), agentes FPA en secuencia con un modelo falso, fuente de documentos en bucket (cliente falso, sin red), agente de documentos como AgentTool (modelo falso), ingesta idempotente, ciclo de refinamiento con control de versión, permisos por rol, validación HITL, asignación por correo desde ADK, reportes y exportación, y las pantallas principales.
 
 ---
 
@@ -643,9 +859,11 @@ app/
   main.py            app FastAPI, sesiones, errores (JSON en /api, HTML en la web)
   models.py          modelo de datos (SQLAlchemy 2)
   schemas.py         contratos de entrada y salida
-  services/          reglas de negocio: workflow, stories, refinement, projects, access, audit
+  services/          reglas de negocio: workflow, stories, refinement, projects, access, audit,
+                     fpa (puntos de función), finops + finops_pricing (costo de generación autónoma),
+                     context_graph + context (grafo de contexto y su ciclo HITL), nfr (tamaño no funcional)
   services/documents/  lectura de PDF, BPMN, MD y TXT desde carpetas o un bucket, por proyecto
-  routers/           API JSON (auth, admin, projects, stories, adk, agents) y web (ui.py)
+  routers/           API JSON (auth, admin, projects, stories, adk, agents, finops, context) y web (ui.py)
   agents/            agentes IA: puertos, runner, proveedores stub y adk (ver sección 4)
   templates/         Jinja2 (UI)
   static/            app.css (tema claro/oscuro) y app.js (tema, toasts, Kanban)
@@ -664,8 +882,11 @@ tests/               pytest (API y UI)
 - Gemini: la integración está probada con un modelo falso; la llamada real requiere tu `GOOGLE_API_KEY`.
 - PDF escaneados (sin texto) no se procesan: falta OCR.
 - El agente interno corre dentro del mismo proceso (en `background`). Si la app se reinicia a mitad de una ejecución, esa ejecución queda en `running`; un worker separado es el siguiente paso si hace falta.
-- Estimación y priorización son campos enviados por ADK o manuales; no hay cálculo automático.
+- La priorización es un campo enviado por ADK o manual; no hay cálculo automático.
+- El dimensionamiento FinOps usa supuestos no calibrados (ver `docs/metodo-fpa-finops.md`): sus cifras son orden de magnitud. El agente FPA usa prompts al estilo FPA-EX, sin el ajuste fino del artículo.
+- El tamaño no funcional (`nfr_snap_lite_v1`) es un puntaje por severidad inspirado en SNAP, no SNAP. El grafo de contexto solo conoce las restricciones que están en los documentos o que una persona agrega; una violación sutil puede pasar inadvertida al agente, por eso la etapa 3 la aprueba una persona.
 - No hay exportación directa a Jira o Trello; el CSV/JSON sirve de puente.
 - Una contraseña enviada en `users[]` se guarda sólo si ese usuario es nuevo; no se cambia en ingestas posteriores. Para cambiarla hace falta una pantalla o endpoint de administración que aún no existe.
 - En desarrollo la app crea las tablas al arrancar (`create_all`). En despliegue usa `alembic upgrade head`.
+- Como el proyecto no está en producción, el cambio de story points a puntos de función y la tabla del grafo de contexto (`context_graphs`, más `nfr_points` y `context_analysis` en las HU) se hicieron **en el esquema inicial**, sin migración nueva. Una base creada antes de ese cambio se recrea: `docker compose down -v`, `docker compose up --build -d` y `docker compose exec app python scripts/seed.py`.
 - Los estilos son CSS propio (sin framework).

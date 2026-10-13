@@ -14,7 +14,7 @@
 
 <div class="grid grid-4" style="margin-bottom:16px">
   <div class="card kpi"><div class="label">Historias</div><div class="value">{{ summary.total_stories }}</div></div>
-  <div class="card kpi"><div class="label">Puntos activos</div><div class="value">{{ '%g'|format(summary.total_points) }}</div></div>
+  <div class="card kpi"><div class="label">Puntos de función</div><div class="value">{{ '%g'|format(summary.total_function_points) }}</div></div>
   <div class="card kpi"><div class="label">Completado</div><div class="value">{{ summary.completion_pct }}%</div>
     <div class="progress" style="margin-top:8px"><span style="width: {{ summary.completion_pct }}%"></span></div></div>
   <div class="card kpi"><div class="label">Etapas HITL aprobadas</div><div class="value">{{ approved }} / 5</div></div>

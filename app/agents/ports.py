@@ -65,13 +65,97 @@ class RefinementInput(BaseModel):
     instructions: str | None = None
 
 
-class EstimationOutput(BaseModel):
-    factors: dict[str, int] = Field(description="Factores 1–5 del método del tipo de HU; el backend calcula los puntos")
-    rationale: str | None = Field(None, max_length=2000, description="Por qué se puntuó así, en una o dos frases")
+class FpaConcept(BaseModel):
+    """Paso «Concept» (ConceptAct): qué entidades y transacciones describe la HU, con evidencia."""
+
+    name: str = Field(min_length=1, max_length=200)
+    kind: Literal["entidad", "transaccion"]
+    evidence: str | None = Field(None, max_length=500, description="Cita o paráfrasis de la HU que lo respalda")
 
 
-class EstimationInput(BaseModel):
+class FpaFunction(BaseModel):
+    """Paso «Act»: una función IFPUG con sus conteos. El backend calcula complejidad y puntos."""
+
+    name: str = Field(min_length=1, max_length=200)
+    type: Literal["ILF", "EIF", "EI", "EO", "EQ"]
+    det: int = Field(ge=1)
+    ret: int | None = Field(None, ge=1, description="Solo ILF/EIF")
+    ftr: int | None = Field(None, ge=0, description="Solo EI/EO/EQ")
+    reused: bool = False
+    rationale: str | None = Field(None, max_length=500)
+
+
+class ImpactedFeature(BaseModel):
+    node_id: str = Field(min_length=1, max_length=64)
+    how: str | None = Field(None, max_length=300)
+
+
+class ConstraintHit(BaseModel):
+    constraint_id: str = Field(min_length=1, max_length=64)
+    reason: str | None = Field(None, max_length=500)
+
+
+class ContextReport(BaseModel):
+    """Informe del agente de contexto: cómo se relaciona la HU con el grafo aprobado del proyecto."""
+
+    impacted_features: list[ImpactedFeature] = Field(default_factory=list, max_length=100)
+    existing_entities: list[str] = Field(default_factory=list, max_length=100, description="ids de entidades o funcionalidades existentes que la HU reusa")
+    triggered_constraints: list[ConstraintHit] = Field(default_factory=list, max_length=100)
+    violations: list[ConstraintHit] = Field(default_factory=list, max_length=100)
+    summary: str | None = Field(None, max_length=2000)
+
+
+class SizingInput(BaseModel):
     story: dict
+    registry: list[str] = Field(default_factory=list, description="ILF/EIF ya contados por HU anteriores")
+    instructions: str | None = None
+    context_graph: dict | None = Field(None, description="Grafo de contexto aprobado: {version, nodes, edges}")
+
+
+class SizingOutput(BaseModel):
+    concepts: list[FpaConcept] = Field(default_factory=list, max_length=200)
+    functions: list[FpaFunction] = Field(default_factory=list, max_length=100)
+    rationale: str | None = Field(None, max_length=2000)
+    context: ContextReport | None = None
+
+    def components(self) -> list[dict]:
+        """Componentes para services/fpa.py (sin campos vacíos)."""
+        return [f.model_dump(exclude_none=True) for f in self.functions]
+
+
+class GraphNode(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    kind: Literal["feature", "entity", "constraint"]
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(None, max_length=1000)
+    status: Literal["existente", "planificado"] | None = None
+    category: str | None = None
+    severity: Literal["baja", "media", "alta", "critica"] | None = None
+    rule: str | None = Field(None, max_length=1000)
+    keywords: list[str] = Field(default_factory=list, max_length=20)
+    source: str | None = Field(None, max_length=300)
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    type: Literal["depends_on", "uses", "applies_to"]
+
+
+class ContextGraphOutput(BaseModel):
+    """Grafo propuesto por el agente. services/context_graph.py lo valida antes de guardarlo como borrador."""
+
+    nodes: list[GraphNode] = Field(default_factory=list, max_length=300)
+    edges: list[GraphEdge] = Field(default_factory=list, max_length=1000)
+    notes: str | None = Field(None, max_length=2000)
+
+    def as_graph(self) -> tuple[list[dict], list[dict]]:
+        return [n.model_dump(exclude_none=True) for n in self.nodes], [e.model_dump() for e in self.edges]
+
+
+class ContextExtractionInput(BaseModel):
+    project_key: str
+    project_name: str
     instructions: str | None = None
 
 
@@ -89,7 +173,11 @@ class AgentProvider(Protocol):
 
     def refine_story(self, data: RefinementInput) -> tuple[RefinementOutput, Usage]: ...
 
-    def estimate_story(self, data: EstimationInput) -> tuple[EstimationOutput, Usage]: ...
+    def size_story(self, data: SizingInput) -> tuple[SizingOutput, Usage]: ...
+
+    def extract_context(
+        self, data: ContextExtractionInput, tools: "DocumentTools"
+    ) -> tuple[ContextGraphOutput, Usage]: ...
 
     def generate_from_documents(
         self, data: DocumentGenerationInput, tools: "DocumentTools"

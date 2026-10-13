@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.models import PipelineStage, Project, ProjectMember, User, utcnow
 from app.services.errors import Conflict, Unprocessable
+from app.services.stories import open_violations
 from app.services.workflow import STATUS_LABELS
 
 STAGE_NAMES = {
@@ -35,6 +36,14 @@ def approve_stage(db: Session, project: Project, number: int, user: User, summar
         raise Conflict(f"La etapa {number} ya está aprobada")
     if number > 1 and stages[number - 1].status != "approved":
         raise Unprocessable(f"Debes aprobar la etapa {number - 1} antes de la etapa {number}")
+    if number == 3:
+        pending = open_violations(project)
+        if pending:
+            listed = ", ".join(f"{v['story']} ({v['constraint_id']})" for v in pending[:10])
+            raise Unprocessable(
+                f"Hay {len(pending)} restricciones violadas sin resolver: {listed}. "
+                "Cambia la HU y vuelve a dimensionarla, o registra una excepción justificada."
+            )
     stage.status = "approved"
     stage.approved_by = user
     stage.approved_at = utcnow()
@@ -88,20 +97,23 @@ def summary(db: Session, project: Project) -> dict:
         out: dict[str, dict] = {}
         for s in stories:
             key = key_fn(s) or "Sin asignar"
-            bucket = out.setdefault(key, {"count": 0, "points": 0.0})
+            bucket = out.setdefault(key, {"count": 0, "function_points": 0.0})
             bucket["count"] += 1
-            bucket["points"] += s.estimate_points or 0
+            bucket["function_points"] += s.function_points or 0
         return out
 
     by_status = {
-        st: {"label": label, **group(lambda s, st=st: st if s.status == st else None).get(st, {"count": 0, "points": 0.0})}
+        st: {"label": label, **group(lambda s, st=st: st if s.status == st else None).get(st, {"count": 0, "function_points": 0.0})}
         for st, label in STATUS_LABELS.items()
     }
 
     return {
         "project": {"key": project.key, "name": project.name},
         "total_stories": total,
-        "total_points": sum(s.estimate_points or 0 for s in active),
+        "total_function_points": sum(s.function_points or 0 for s in active),
+        "unsized_stories": sum(1 for s in active if s.function_points is None),
+        "total_nfr_points": sum(s.nfr_points or 0 for s in active),
+        "open_violations": open_violations(project),
         "completion_pct": round(100 * len(done) / len(active), 1) if active else 0.0,
         "by_status": by_status,
         "by_type": group(lambda s: s.type),
@@ -125,7 +137,8 @@ def export_rows(project: Project) -> list[dict]:
                 "acceptance_criteria": s.acceptance_criteria or "",
                 "type": s.type or "",
                 "status": s.status,
-                "estimate_points": s.estimate_points if s.estimate_points is not None else "",
+                "function_points": s.function_points if s.function_points is not None else "",
+                "nfr_points": s.nfr_points if s.nfr_points is not None else "",
                 "priority_rank": s.priority_rank if s.priority_rank is not None else "",
                 "assignee": s.assignee.email if s.assignee else "",
                 "source_ref": s.source_ref or "",

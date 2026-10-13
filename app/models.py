@@ -104,9 +104,12 @@ class UserStory(Base):
     type: Mapped[str | None] = mapped_column(String(24))
     type_justification: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="borrador", index=True)
-    estimate_points: Mapped[float | None] = mapped_column(Float)
-    estimate_method: Mapped[str | None] = mapped_column(String(64))
-    estimate_factors: Mapped[dict | None] = mapped_column(JSON)
+    # Tamaño funcional (puntos de función IFPUG sin ajustar) y su análisis; ver services/fpa.py.
+    function_points: Mapped[float | None] = mapped_column(Float)
+    fp_analysis: Mapped[dict | None] = mapped_column(JSON)
+    # Tamaño no funcional y análisis contra el grafo de contexto (restricciones, violaciones); ver services/nfr.py.
+    nfr_points: Mapped[float | None] = mapped_column(Float)
+    context_analysis: Mapped[dict | None] = mapped_column(JSON)
     priority_rank: Mapped[int | None] = mapped_column(Integer)
     priority_method: Mapped[str | None] = mapped_column(String(64))
     source_ref: Mapped[str | None] = mapped_column(Text)
@@ -162,6 +165,37 @@ class RefinementRequest(Base):
     story: Mapped[UserStory] = relationship(back_populates="refinements")
 
 
+class ContextGraph(Base):
+    """Una versión del grafo de contexto de un proyecto. Las versiones no se borran (trazabilidad).
+
+    status: draft (propuesta del agente o de una persona) → approved (la usa el dimensionamiento) →
+    superseded (reemplazada por una aprobación posterior); o rejected.
+    """
+
+    __tablename__ = "context_graphs"
+    __table_args__ = (UniqueConstraint("project_id", "version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    nodes: Mapped[list] = mapped_column(JSON, default=list)
+    edges: Mapped[list] = mapped_column(JSON, default=list)
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(160))
+    agent_run_id: Mapped[int | None] = mapped_column(Integer)
+    log: Mapped[list] = mapped_column(JSON, default=list)
+    reviewed_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    reviewed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    project: Mapped[Project] = relationship()
+    reviewed_by: Mapped[User | None] = relationship()
+
+
 class PipelineStage(Base):
     __tablename__ = "pipeline_stages"
     __table_args__ = (UniqueConstraint("project_id", "stage_number"),)
@@ -184,7 +218,7 @@ class AgentRun(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     story_id: Mapped[int | None] = mapped_column(ForeignKey("user_stories.id", ondelete="SET NULL"))
-    kind: Mapped[str] = mapped_column(String(24))  # generate_stories | generate_from_docs | refine_story | estimate_story
+    kind: Mapped[str] = mapped_column(String(24))  # generate_stories | generate_from_docs | refine_story | size_story | size_backlog | extract_context
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     provider: Mapped[str] = mapped_column(String(32))
     model: Mapped[str | None] = mapped_column(String(120))

@@ -6,13 +6,14 @@ Reglas que este módulo hace cumplir (no el proveedor):
   y termina en `refinada`. Nunca aprueba etapas HITL ni mueve HU a `lista`.
 - Cada ejecución queda en `agent_runs` (estado, error, tokens, costo).
 - Una falla no deja HU a medias: la generación se hace en una sola transacción.
-- La estimación solo puntúa factores (el LLM); los puntos los calcula `services/estimation.py`.
+- El dimensionamiento solo identifica y clasifica funciones (el LLM); los puntos los calcula `services/fpa.py`.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable
 
@@ -23,18 +24,21 @@ from sqlalchemy.orm import Session
 from app.agents.document_tools import make_document_tools
 from app.agents.ports import (
     AgentNotConfigured,
+    ContextExtractionInput,
     DocumentGenerationInput,
-    EstimationInput,
     GeneratedStory,
     GenerationInput,
     RefinementInput,
+    SizingInput,
+    Usage,
 )
 from app.agents.registry import get_provider
 from app.config import settings
 from app.db import SessionLocal
 from app.models import AgentRun, Project, RefinementRequest, UserStory, utcnow
 from app.schemas import RefinementResult
-from app.services import audit
+from app.services import audit, context_graph, fpa, nfr
+from app.services import context as context_service
 from app.services import refinement as refinement_service
 from app.services import stories as story_service
 from app.services.documents import get_document_source
@@ -356,9 +360,68 @@ def auto_refine_if_enabled(db: Session, project: Project, request, user_id: int 
         log.warning("Auto-refinamiento omitido: proveedor de IA no configurado")
 
 
-# ---------- estimación de una HU (etapa 3) ----------
+# ---------- dimensionamiento con puntos de función (etapa 3) ----------
 
-def start_estimation(
+def _normalize(name: str) -> str:
+    plain = unicodedata.normalize("NFKD", name)
+    return " ".join("".join(c for c in plain if not unicodedata.combining(c)).lower().split())
+
+
+def _size_one(
+    db: Session, project: Project, story: UserStory, provider, actor: Actor, registry: list[str], instructions: str | None,
+    graph: dict | None = None,
+) -> tuple[Usage, dict]:
+    """Pide al agente los componentes FPA de una HU y los guarda: el servidor calcula los puntos.
+
+    Con un grafo de contexto aprobado, el agente de contexto informa qué restricciones activa o viola la HU;
+    el servidor descarta ids que no existan, toma la severidad del grafo y calcula el tamaño no funcional.
+    """
+    output, usage = provider.size_story(SizingInput(
+        story=story_service.snapshot(story), registry=list(registry), instructions=instructions, context_graph=graph,
+    ))
+    known = {_normalize(n) for n in registry}
+    components = output.components()
+    for item in components:
+        # Regla del servidor, no del modelo: una ILF/EIF ya contada por una HU anterior suma 0.
+        if item["type"] in fpa.DATA_TYPES and _normalize(item["name"]) in known:
+            item["reused"] = True
+    notes = {
+        "sized_by": actor.name,
+        "concepts": [c.model_dump(exclude_none=True) for c in output.concepts],
+        "rationale": output.rationale,
+        "registry": list(registry),
+    }
+    analysis = None
+    if graph is not None:
+        report = output.context.model_dump() if output.context else None
+        analysis = nfr.analyze(graph, graph.get("version"), report, previous=story.context_analysis)
+    changes = {
+        "fp_components": components, "fp_notes": notes,
+        "nfr_points": analysis["nfr_points"] if analysis else None, "context_analysis": analysis,
+    }
+    diff = story_service.apply_changes(db, project, story, changes, actor)
+    if output.rationale:
+        audit.record(db, story, actor, "sizing_rationale", diff={"rationale": output.rationale})
+    open_ids = [v["constraint_id"] for v in nfr.open_violations(analysis)]
+    if open_ids:
+        audit.record(db, story, actor, "constraint_violations", diff={"open": open_ids})
+    return usage, {
+        "story": story.code, "function_points": story.function_points, "nfr_points": story.nfr_points,
+        "open_violations": open_ids, "changed": sorted(diff),
+    }
+
+
+def _approved_graph(db: Session, project: Project) -> dict | None:
+    graph = context_service.approved(db, project)
+    return {"version": graph.version, "nodes": graph.nodes, "edges": graph.edges} if graph else None
+
+
+def _active_in_order(db: Session, project: Project) -> list[UserStory]:
+    """Mismo orden de generación que el modelo FinOps: prioridad (vacías al final) y luego id."""
+    return [s for s in story_service.list_stories(db, project) if s.status != "descartada"]
+
+
+def start_sizing(
     db: Session,
     project: Project,
     story: UserStory,
@@ -367,21 +430,49 @@ def start_estimation(
     instructions: str | None,
     background: BackgroundTasks | None,
 ) -> AgentRun:
-    if story.type not in ("HU_IA", "HU_TRADICIONAL"):
-        raise Unprocessable("La HU necesita tipo HU_IA o HU_TRADICIONAL antes de estimarse")
+    if story.status == "descartada":
+        raise Unprocessable("Una HU descartada no se dimensiona")
     provider_name, model = _provider_identity()
     run = _new_run(
-        db, project, "estimate_story", provider_name, model,
+        db, project, "size_story", provider_name, model,
         story_id=story.id, input_ref=story.code, input_chars=len(story.acceptance_criteria or ""),
         requested_by_id=user_id,
     )
     run_id = run.id
-    _dispatch(background, execute_estimation, run_id, project.key, story.code, instructions)
+    _dispatch(background, execute_sizing, run_id, project.key, [story.code], instructions)
     db.expire_all()
     return db.get(AgentRun, run_id)
 
 
-def execute_estimation(run_id: int, project_key: str, story_code: str, instructions: str | None) -> None:
+def start_backlog_sizing(
+    db: Session,
+    project: Project,
+    *,
+    resize: bool,
+    user_id: int | None,
+    instructions: str | None,
+    background: BackgroundTasks | None,
+) -> AgentRun:
+    """Dimensiona en orden todas las HU activas sin puntos (o todas con `resize`)."""
+    provider_name, model = _provider_identity()
+    codes = [s.code for s in _active_in_order(db, project) if resize or s.function_points is None]
+    if not codes:
+        raise Unprocessable("No hay HU por dimensionar (usa resize para recalcular todas)")
+    run = _new_run(
+        db, project, "size_backlog", provider_name, model,
+        input_ref=f"{len(codes)} HU: {', '.join(codes)}"[:500], requested_by_id=user_id,
+    )
+    run_id = run.id
+    _dispatch(background, execute_sizing, run_id, project.key, codes, instructions)
+    db.expire_all()
+    return db.get(AgentRun, run_id)
+
+
+def execute_sizing(run_id: int, project_key: str, codes: list[str], instructions: str | None) -> None:
+    """Recorre las HU activas en orden; dimensiona las de `codes` y hace crecer el registro de entidades.
+
+    Una sola transacción: si una HU falla, no queda ninguna a medias. Nunca cambia estados ni aprueba etapas.
+    """
     db = SessionLocal()
     try:
         run = db.get(AgentRun, run_id)
@@ -390,23 +481,102 @@ def execute_estimation(run_id: int, project_key: str, story_code: str, instructi
         try:
             provider = get_provider()
             project = db.scalar(select(Project).where(Project.key == project_key))
-            story = story_service.get_story(db, project, story_code)
-            output, usage = provider.estimate_story(
-                EstimationInput(story=story_service.snapshot(story), instructions=instructions)
-            )
             actor = ServiceActor(provider.name).as_actor()
-            # Factores → puntos en el servicio de HU: valida tipo, rango y método, y deja diff en el historial.
-            diff = story_service.apply_changes(db, project, story, {"estimate_factors": output.factors}, actor)
-            if output.rationale:
-                audit.record(db, story, actor, "estimation_rationale", diff={"rationale": output.rationale})
+            graph = _approved_graph(db, project)
+            # Las entidades que el sistema ya tiene (grafo aprobado) son reuso desde la primera HU.
+            registry = context_graph.existing_names(graph, "entity") if graph else []
+            targets, sized = set(codes), []
+            total = Usage(model=provider.model)
+            for story in _active_in_order(db, project):
+                if story.code in targets:
+                    usage, result = _size_one(db, project, story, provider, actor, registry, instructions, graph)
+                    total.model = usage.model or total.model
+                    total.tokens_in += usage.tokens_in
+                    total.tokens_out += usage.tokens_out
+                    sized.append(result)
+                registry += [n for n in fpa.data_function_names(story.fp_analysis) if n not in registry]
+            missing = sorted(targets - {r["story"] for r in sized})
+            if missing:
+                raise Unprocessable(f"HU no disponibles para dimensionar: {', '.join(missing)}")
             run = db.get(AgentRun, run_id)
             run.result = {
-                "story": story.code,
-                "points": story.estimate_points,
-                "method": story.estimate_method,
-                "changed": sorted(diff),
-                "rationale": output.rationale,
+                "sized": sized,
+                "function_points": sum(r["function_points"] or 0 for r in sized),
+                "nfr_points": sum(r["nfr_points"] or 0 for r in sized),
+                "open_violations": {r["story"]: r["open_violations"] for r in sized if r["open_violations"]},
+                "context_graph_version": graph["version"] if graph else None,
+                "registry": registry,
             }
+            if len(sized) == 1:
+                run.result.update(story=sized[0]["story"], points=sized[0]["function_points"])
+            run.model, run.tokens_in, run.tokens_out = total.model, total.tokens_in, total.tokens_out
+            run.cost_usd = _cost(total.tokens_in, total.tokens_out)
+            run.status = "succeeded"
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            run = db.get(AgentRun, run_id)
+            run.status, run.error = "failed", _error_text(exc)
+            db.commit()
+            log.warning("Dimensionamiento %s falló: %s", run_id, exc)
+        finally:
+            run = db.get(AgentRun, run_id)
+            run.finished_at = utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+# ---------- grafo de contexto (lo propone el agente, lo aprueba una persona) ----------
+
+def start_context_extraction(
+    db: Session,
+    project: Project,
+    *,
+    user_id: int | None,
+    instructions: str | None,
+    background: BackgroundTasks | None,
+) -> AgentRun:
+    provider_name, model = _provider_identity()
+    source = get_document_source(project.key)
+    if not source.list():
+        raise Unprocessable(f"No hay documentos en {source.location} para extraer el contexto")
+    run = _new_run(
+        db, project, "extract_context", provider_name, model,
+        input_ref=f"documentos: {source.location}"[:500], requested_by_id=user_id,
+    )
+    run_id = run.id
+    _dispatch(background, execute_context_extraction, run_id, project.key, instructions)
+    db.expire_all()
+    return db.get(AgentRun, run_id)
+
+
+def execute_context_extraction(run_id: int, project_key: str, instructions: str | None) -> None:
+    """Guarda la propuesta del agente como BORRADOR. Nunca la aprueba: eso lo hace una persona."""
+    db = SessionLocal()
+    try:
+        run = db.get(AgentRun, run_id)
+        project = db.scalar(select(Project).where(Project.key == project_key))
+        run.status, run.started_at = "running", utcnow()
+        db.commit()
+        try:
+            provider = get_provider()
+            tools = make_document_tools(get_document_source(project.key), settings.agent_max_doc_chars)
+            output, usage = provider.extract_context(
+                ContextExtractionInput(project_key=project.key, project_name=project.name, instructions=instructions),
+                tools,
+            )
+            nodes, edges = output.as_graph()
+            graph = context_service.create_draft(
+                db, project, nodes, edges, created_by=f"agent:{provider.name}", sources=tools.documents_read,
+                notes=output.notes, agent_run_id=run_id,
+            )
+            run = db.get(AgentRun, run_id)
+            run.result = {
+                "version": graph.version, "status": graph.status, "documents_read": tools.documents_read,
+                "summary": context_graph.summary({"nodes": graph.nodes, "edges": graph.edges}),
+            }
+            run.input_chars = tools.chars_served
             run.model, run.tokens_in, run.tokens_out = usage.model, usage.tokens_in, usage.tokens_out
             run.cost_usd = _cost(usage.tokens_in, usage.tokens_out)
             run.status = "succeeded"
@@ -416,7 +586,7 @@ def execute_estimation(run_id: int, project_key: str, story_code: str, instructi
             run = db.get(AgentRun, run_id)
             run.status, run.error = "failed", _error_text(exc)
             db.commit()
-            log.warning("Estimación %s falló: %s", run_id, exc)
+            log.warning("Extracción de contexto %s falló: %s", run_id, exc)
         finally:
             run = db.get(AgentRun, run_id)
             run.finished_at = utcnow()
@@ -444,13 +614,16 @@ def _error_text(exc: Exception) -> str:
 __all__ = [
     "AgentNotConfigured",
     "auto_refine_if_enabled",
-    "execute_estimation",
+    "execute_context_extraction",
+    "execute_sizing",
     "execute_generation",
     "execute_generation_from_documents",
     "execute_refinement",
     "external_id_for",
     "run_out",
-    "start_estimation",
+    "start_backlog_sizing",
+    "start_context_extraction",
+    "start_sizing",
     "start_generation",
     "start_generation_from_documents",
     "start_refinement",

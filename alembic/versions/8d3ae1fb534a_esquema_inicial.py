@@ -102,9 +102,10 @@ def upgrade() -> None:
     sa.Column('type', sa.String(length=24), nullable=True),
     sa.Column('type_justification', sa.Text(), nullable=True),
     sa.Column('status', sa.String(length=32), nullable=False),
-    sa.Column('estimate_points', sa.Float(), nullable=True),
-    sa.Column('estimate_method', sa.String(length=64), nullable=True),
-    sa.Column('estimate_factors', sa.JSON(), nullable=True),
+    sa.Column('function_points', sa.Float(), nullable=True),
+    sa.Column('fp_analysis', sa.JSON(), nullable=True),
+    sa.Column('nfr_points', sa.Float(), nullable=True),
+    sa.Column('context_analysis', sa.JSON(), nullable=True),
     sa.Column('priority_rank', sa.Integer(), nullable=True),
     sa.Column('priority_method', sa.String(length=64), nullable=True),
     sa.Column('source_ref', sa.Text(), nullable=True),
@@ -119,6 +120,30 @@ def upgrade() -> None:
     sa.UniqueConstraint('project_id', 'external_id')
     )
     op.create_index(op.f('ix_user_stories_status'), 'user_stories', ['status'], unique=False)
+    op.create_table('context_graphs',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('version', sa.Integer(), nullable=False),
+    sa.Column('status', sa.String(length=16), nullable=False),
+    sa.Column('nodes', sa.JSON(), nullable=False),
+    sa.Column('edges', sa.JSON(), nullable=False),
+    sa.Column('sources', sa.JSON(), nullable=False),
+    sa.Column('notes', sa.Text(), nullable=True),
+    sa.Column('created_by', sa.String(length=160), nullable=False),
+    sa.Column('agent_run_id', sa.Integer(), nullable=True),
+    sa.Column('log', sa.JSON(), nullable=False),
+    sa.Column('reviewed_by_id', sa.Integer(), nullable=True),
+    sa.Column('reviewed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('review_notes', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['reviewed_by_id'], ['users.id'], ondelete='SET NULL'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('project_id', 'version')
+    )
+    op.create_index(op.f('ix_context_graphs_project_id'), 'context_graphs', ['project_id'], unique=False)
+    op.create_index(op.f('ix_context_graphs_status'), 'context_graphs', ['status'], unique=False)
     op.create_table('refinement_requests',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -160,6 +185,9 @@ def downgrade() -> None:
     op.drop_table('story_events')
     op.drop_index(op.f('ix_refinement_requests_status'), table_name='refinement_requests')
     op.drop_table('refinement_requests')
+    op.drop_index(op.f('ix_context_graphs_status'), table_name='context_graphs')
+    op.drop_index(op.f('ix_context_graphs_project_id'), table_name='context_graphs')
+    op.drop_table('context_graphs')
     op.drop_index(op.f('ix_user_stories_status'), table_name='user_stories')
     op.drop_table('user_stories')
     op.drop_table('project_members')

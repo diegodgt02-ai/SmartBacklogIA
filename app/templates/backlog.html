@@ -30,7 +30,7 @@
     <label for="f-sort">Ordenar por</label>
     <select id="f-sort" name="sort">
       <option value="priority" {{ 'selected' if filters.sort == 'priority' }}>Prioridad</option>
-      <option value="points" {{ 'selected' if filters.sort == 'points' }}>Estimación</option>
+      <option value="function_points" {{ 'selected' if filters.sort == 'function_points' }}>Puntos de función</option>
       <option value="status" {{ 'selected' if filters.sort == 'status' }}>Estado</option>
       <option value="title" {{ 'selected' if filters.sort == 'title' }}>Título</option>
     </select>
@@ -85,7 +85,7 @@
       <h2>{{ g.epic.title if g.epic else 'Sin épica' }}</h2>
       <span class="count">{{ g.stories|length }} HU</span>
       <span class="spacer"></span>
-      <span class="small muted">{{ '%g'|format(g.stories|map(attribute='estimate_points')|select|sum) }} pts</span>
+      <span class="small muted">{{ '%g'|format(g.stories|map(attribute='function_points')|select|sum) }} FP</span>
     </div>
     <div class="epic-body">
       {% for s in g.stories %}
@@ -94,7 +94,7 @@
         <a class="story-title" href="/p/{{ project.key }}/stories/{{ s.code }}">{{ s.title }}</a>
         <span>{{ m.type_badge(s.type) }}</span>
         <span>{{ m.status_badge(s.status) }}</span>
-        <span>{{ m.points(s.estimate_points) }}{% if s.estimate_factors and s.estimate_factors.spike and s.estimate_factors.spike.required %} <span class="badge none" title="Requiere spike de experimentación">+ spike</span>{% endif %}</span>
+        <span>{{ m.fp(s.function_points) }}</span>
         <span class="small muted">{{ '#' ~ s.priority_rank if s.priority_rank is not none else '—' }}</span>
       </div>
       {% endfor %}

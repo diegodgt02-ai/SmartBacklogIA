@@ -147,30 +147,6 @@ def test_full_generation_run_with_adk_records_tokens_and_cost(adk_generation):
     assert events[0]["actor_name"] == "agent:adk"
 
 
-def test_estimate_story_through_adk_keeps_only_factors_of_the_story_type():
-    from app.agents.ports import EstimationInput
-
-    # El modelo devuelve factores de ambos tipos; para HU_IA solo deben pasar los de IA.
-    payload = {"datos": 4, "modelo": 3, "evaluacion": 2, "riesgo": 3, "integracion": 2,
-               "complejidad": 5, "esfuerzo": 5, "incertidumbre": 5, "rationale": "Datos históricos incompletos."}
-    provider = provider_with(payload)
-    story = {"code": "PAGO-2", "title": "Clasificar fraude", "type": "HU_IA", "acceptance_criteria": "- [ ] x"}
-    output, usage = provider.estimate_story(EstimationInput(story=story))
-    assert output.factors == {"datos": 4, "modelo": 3, "evaluacion": 2, "riesgo": 3, "integracion": 2}
-    assert output.rationale == "Datos históricos incompletos."
-    assert usage.tokens_in == 120
-
-
-def test_estimation_schema_has_no_length_constraints():
-    import json as _json
-
-    from app.agents.providers.adk import _LlmEstimationOutput
-
-    text = _json.dumps(_LlmEstimationOutput.model_json_schema())
-    for forbidden in ("minimum", "maximum", "minLength", "maxLength", "pattern"):
-        assert forbidden not in text
-
-
 class ScriptedGemini(BaseLlm):
     """Imita a Gemini con herramientas: el generador consulta a agente_documentos (AgentTool),
     que lista y lee la carpeta; luego el generador responde con set_model_response.
@@ -248,3 +224,183 @@ def test_generate_from_documents_uses_document_agent_as_agent_tool(tmp_path):
     assert fake.calls == [("generador", 0), ("documentos", 0), ("documentos", 1), ("documentos", 2), ("generador", 1)]
     # 5 llamadas al modelo: 2 del generador + 3 del agente anidado.
     assert (usage.tokens_in, usage.tokens_out) == (50, 25)
+
+
+class FpaGemini(BaseLlm):
+    """Imita a Gemini en el pipeline FPA: responde según el paso (concepto o clasificación) de la instrucción."""
+
+    model: str = "fake-gemini-pro"
+    seen: list = []
+
+    async def generate_content_async(self, llm_request, stream=False):
+        instruction = str(llm_request.config.system_instruction)
+        if "Paso 1 de 2" in instruction:
+            self.seen.append(("concept", "Registro de entidades ya contadas en el proyecto (ILF/EIF): Cliente" in str(llm_request.contents)))
+            payload = {"concepts": [
+                {"name": "Pago", "kind": "entidad", "evidence": "pagar con tarjeta"},
+                {"name": "Cliente", "kind": "entidad", "evidence": "como cliente"},
+                {"name": "Registrar pago", "kind": "transaccion", "evidence": "- [ ] Registra el pago"},
+            ]}
+        else:
+            # El paso 2 recibe en su instrucción los conceptos que el paso 1 dejó en el estado.
+            self.seen.append(("act", "Registrar pago" in instruction))
+            payload = {"functions": [
+                {"name": "Pago", "type": "ILF", "det": 12, "ret": 2},
+                {"name": "Cliente", "type": "ILF", "det": 8, "ret": 1, "reused": True},
+                {"name": "Registrar pago", "type": "EI", "det": 8, "ftr": 2, "rationale": "Mantiene Pago y lee Cliente"},
+            ], "rationale": "Cliente ya existe en el registro."}
+        yield LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text=json.dumps(payload))]),
+            usage_metadata=types.GenerateContentResponseUsageMetadata(prompt_token_count=10, candidates_token_count=5),
+            turn_complete=True,
+        )
+
+
+def test_size_story_runs_concept_then_act_agents_in_sequence():
+    from app.agents.ports import SizingInput
+    from app.services import fpa
+
+    fake = FpaGemini(seen=[])
+    provider = AdkProvider(model="gemini-2.5-pro", api_key="clave-falsa-de-prueba", llm=fake)
+    story = {"code": "PAGO-1", "title": "Pagar con tarjeta", "role": "cliente", "need": "pagar con tarjeta",
+             "acceptance_criteria": "- [ ] Registra el pago", "type": "HU_TRADICIONAL"}
+    output, usage = provider.size_story(SizingInput(story=story, registry=["Cliente"]))
+
+    assert fake.seen == [("concept", True), ("act", True)]
+    assert [c.name for c in output.concepts] == ["Pago", "Cliente", "Registrar pago"]
+    assert [f.type for f in output.functions] == ["ILF", "ILF", "EI"]
+    assert output.rationale == "Cliente ya existe en el registro."
+    assert (usage.tokens_in, usage.tokens_out) == (20, 10)  # dos agentes, dos llamadas
+    assert fpa.analyze(output.components())["ufp"] == 7 + 0 + 4
+
+
+def test_fpa_schemas_sent_to_gemini_have_no_length_constraints():
+    import json as _json
+
+    from app.agents.providers.adk import _LlmConcepts, _LlmFunctions
+
+    for model in (_LlmConcepts, _LlmFunctions):
+        text = _json.dumps(model.model_json_schema())
+        for forbidden in ("minLength", "maxLength", "minItems", "maxItems", "minimum", "maximum", "pattern"):
+            assert forbidden not in text, f"{model.__name__} expone {forbidden}"
+
+
+def test_invalid_fpa_output_is_rejected_by_strict_dtos():
+    from pydantic import ValidationError
+
+    from app.agents.ports import SizingInput
+
+    class ZeroDet(FpaGemini):
+        async def generate_content_async(self, llm_request, stream=False):
+            text = '{"concepts": []}' if "Paso 1 de 2" in str(llm_request.config.system_instruction) else \
+                '{"functions": [{"name": "X", "type": "EI", "det": 0, "ftr": 1}]}'
+            yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]), turn_complete=True)
+
+    provider = AdkProvider(model="gemini-2.5-pro", api_key="clave-falsa-de-prueba", llm=ZeroDet(seen=[]))
+    with pytest.raises(ValidationError):
+        provider.size_story(SizingInput(story={"code": "X-1", "title": "Algo"}))
+
+
+CONTEXT_GRAPH = {
+    "version": 4,
+    "nodes": [
+        {"id": "cliente", "kind": "entity", "name": "Cliente", "status": "existente"},
+        {"id": "privacidad-datos", "kind": "constraint", "name": "Datos locales", "category": "privacidad",
+         "severity": "critica", "rule": "Los datos de clientes no salen de servidores propios", "keywords": []},
+    ],
+    "edges": [{"source": "privacidad-datos", "target": "cliente", "type": "applies_to"}],
+}
+
+
+class ContextAwareGemini(FpaGemini):
+    """Tres pasos: arquitecto (contexto) → conceptos → clasificación."""
+
+    async def generate_content_async(self, llm_request, stream=False):
+        instruction = str(llm_request.config.system_instruction)
+        if "Actúas como el arquitecto" in instruction:
+            self.seen.append(("architect", "<grafo_de_contexto version=\"4\">" in str(llm_request.contents)))
+            payload = {"impacted_features": [], "existing_entities": ["cliente"],
+                       "triggered_constraints": [{"constraint_id": "privacidad-datos", "reason": "Usa datos de clientes"}],
+                       "violations": [{"constraint_id": "privacidad-datos", "reason": "Los envía a OpenAI"}],
+                       "summary": "Viola la restricción de privacidad."}
+            yield LlmResponse(
+                content=types.Content(role="model", parts=[types.Part(text=json.dumps(payload))]),
+                usage_metadata=types.GenerateContentResponseUsageMetadata(prompt_token_count=10, candidates_token_count=5),
+                turn_complete=True,
+            )
+            return
+        if "Paso 2 de 2" in instruction:
+            # El analista de FPA recibe el informe del arquitecto en su instrucción.
+            self.seen.append(("report-in-act", "Viola la restricción de privacidad." in instruction))
+        async for response in super().generate_content_async(llm_request, stream):
+            yield response
+
+
+def test_size_story_with_context_runs_architect_first():
+    from app.agents.ports import SizingInput
+
+    fake = ContextAwareGemini(seen=[])
+    provider = AdkProvider(model="gemini-2.5-pro", api_key="clave-falsa-de-prueba", llm=fake)
+    story = {"code": "PAGO-1", "title": "Pagar con tarjeta", "acceptance_criteria": "- [ ] Registra el pago"}
+    output, usage = provider.size_story(SizingInput(story=story, registry=["Cliente"], context_graph=CONTEXT_GRAPH))
+
+    assert fake.seen[0] == ("architect", True)
+    assert ("report-in-act", True) in fake.seen
+    assert output.context.violations[0].constraint_id == "privacidad-datos"
+    assert output.context.existing_entities == ["cliente"]
+    assert (usage.tokens_in, usage.tokens_out) == (30, 15)  # tres agentes
+
+
+class ExtractorGemini(BaseLlm):
+    """Imita al arquitecto que lee los documentos con herramientas y entrega el grafo con set_model_response."""
+
+    model: str = "fake-gemini-pro"
+
+    async def generate_content_async(self, llm_request, stream=False):
+        done = [p.function_response.response for c in llm_request.contents for p in (c.parts or []) if p.function_response]
+        if not done:
+            call = types.FunctionCall(name="listar_documentos", args={})
+        elif len(done) == 1:
+            call = types.FunctionCall(name="leer_documento", args={"nombre": done[0]["documentos"][0]["nombre"]})
+        else:
+            assert "nunca salen" in done[1]["texto"]
+            call = types.FunctionCall(name="set_model_response", args={
+                "nodes": [
+                    {"id": "pagos", "kind": "feature", "name": "Pagos", "status": "planificado"},
+                    {"id": "datos-locales", "kind": "constraint", "name": "Datos locales", "category": "privacidad",
+                     "severity": "critica", "rule": "Los datos nunca salen de servidores propios",
+                     "keywords": ["api externa"], "source": "reunion.md · Restricciones"},
+                ],
+                "edges": [{"source": "datos-locales", "target": "pagos", "type": "applies_to"}],
+                "notes": "Extraído de la reunión.",
+            })
+        yield LlmResponse(content=types.Content(role="model", parts=[types.Part(function_call=call)]), turn_complete=True)
+
+
+def test_extract_context_reads_documents_with_tools(tmp_path):
+    from app.agents.document_tools import make_document_tools
+    from app.agents.ports import ContextExtractionInput
+    from app.services import context_graph
+    from app.services.documents import FolderSource
+
+    (tmp_path / "PAGO").mkdir()
+    (tmp_path / "PAGO" / "reunion.md").write_text("# Restricciones\n- Los datos nunca salen de servidores propios\n")
+    tools = make_document_tools(FolderSource(tmp_path, "PAGO"), max_total_chars=10_000)
+    provider = AdkProvider(model="gemini-2.5-pro", api_key="clave-falsa-de-prueba", llm=ExtractorGemini())
+
+    output, _ = provider.extract_context(ContextExtractionInput(project_key="PAGO", project_name="Pagos"), tools)
+    nodes, edges = output.as_graph()
+    graph = context_graph.validate(nodes, edges)
+    assert context_graph.summary(graph) == {"feature": 1, "entity": 0, "constraint": 1, "edges": 1}
+    assert tools.documents_read == ["reunion.md"] and output.notes == "Extraído de la reunión."
+
+
+def test_context_schemas_sent_to_gemini_have_no_length_constraints():
+    import json as _json
+
+    from app.agents.providers.adk import _LlmContextReport, _LlmGraph
+
+    for model in (_LlmGraph, _LlmContextReport):
+        text = _json.dumps(model.model_json_schema())
+        for forbidden in ("minLength", "maxLength", "minItems", "maxItems", "minimum", "maximum", "pattern"):
+            assert forbidden not in text, f"{model.__name__} expone {forbidden}"

@@ -1,4 +1,4 @@
-"""Endpoints de agentes IA: generar HU desde documentos, refinar y estimar HU. Ver app/agents."""
+"""Endpoints de agentes IA: generar HU desde documentos, refinar y dimensionar HU (FPA). Ver app/agents."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session
 from app.agents.registry import provider_status
 from app.agents.runner import (
     run_out,
-    start_estimation,
+    start_backlog_sizing,
+    start_context_extraction,
     start_generation,
     start_generation_from_documents,
     start_refinement,
+    start_sizing,
 )
 from app.config import settings
 from app.db import get_db
@@ -43,7 +45,16 @@ class RefineIn(BaseModel):
     instructions: str | None = Field(None, max_length=2000)
 
 
-class EstimateIn(BaseModel):
+class ExtractContextIn(BaseModel):
+    instructions: str | None = Field(None, max_length=2000)
+
+
+class SizeIn(BaseModel):
+    instructions: str | None = Field(None, max_length=2000)
+
+
+class SizeBacklogIn(BaseModel):
+    resize: bool = Field(False, description="true: recalcula también las HU que ya tienen puntos de función")
     instructions: str | None = Field(None, max_length=2000)
 
 
@@ -157,20 +168,59 @@ def refine_story(
     return run_out(run)
 
 
-@router.post("/projects/{key}/stories/{code}/agents/estimate", status_code=202)
-def estimate_story(
+@router.post("/projects/{key}/agents/extract-context", status_code=202)
+def extract_context(
     key: str,
-    code: str,
-    body: EstimateIn,
+    body: ExtractContextIn,
     background: BackgroundTasks,
     principal: Principal = Depends(get_principal),
     db: Session = Depends(get_db),
 ):
+    """El arquitecto (agente) lee los documentos y propone el grafo de contexto como BORRADOR.
+
+    Una persona lo revisa y lo aprueba en `/projects/{key}/context/draft/approve`; hasta entonces no se usa.
+    """
+    project = load_project(db, key)
+    require_member(db, project, principal, write=True)
+    run = start_context_extraction(
+        db, project, user_id=_write_user_id(principal), instructions=body.instructions, background=background,
+    )
+    return run_out(run)
+
+
+@router.post("/projects/{key}/stories/{code}/agents/size", status_code=202)
+def size_story(
+    key: str,
+    code: str,
+    body: SizeIn,
+    background: BackgroundTasks,
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    """Puntos de función de una HU (agentes concepto → clasificación). No cambia el estado ni aprueba la etapa 3."""
     project = load_project(db, key)
     require_member(db, project, principal, write=True)
     story = story_service.get_story(db, project, code)
-    run = start_estimation(
+    run = start_sizing(
         db, project, story, user_id=_write_user_id(principal),
+        instructions=body.instructions, background=background,
+    )
+    return run_out(run)
+
+
+@router.post("/projects/{key}/agents/size-backlog", status_code=202)
+def size_backlog(
+    key: str,
+    body: SizeBacklogIn,
+    background: BackgroundTasks,
+    principal: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    """Dimensiona en orden de generación todas las HU activas sin puntos (o todas con `resize`)."""
+    project = load_project(db, key)
+    require_member(db, project, principal, write=True)
+    run = start_backlog_sizing(
+        db, project, resize=body.resize, user_id=_write_user_id(principal),
         instructions=body.instructions, background=background,
     )
     return run_out(run)

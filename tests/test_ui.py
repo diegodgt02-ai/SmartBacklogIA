@@ -65,14 +65,14 @@ def test_web_edit_story_and_approve_stage(client, service_key):
 
     res = client.post(
         "/p/DEMO/stories/DEMO-1/edit",
-        data={"title": "Iniciar sesión (editada)", "epic": "Autenticación", "estimate_points": "3.5", "priority_rank": "2",
+        data={"title": "Iniciar sesión (editada)", "epic": "Autenticación", "priority_rank": "2",
               "criteria": "Muestra error"},
         follow_redirects=False,
     )
     assert res.status_code == 303
     story = client.get("/api/v1/projects/DEMO/stories/DEMO-1").json()
     assert story["title"] == "Iniciar sesión (editada)"
-    assert story["estimate_points"] == 3.5 and story["priority_rank"] == 2
+    assert story["priority_rank"] == 2
 
     res = client.post("/p/DEMO/pipeline/1/approve", data={"summary": "ok"}, follow_redirects=False)
     assert res.status_code == 303

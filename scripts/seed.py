@@ -34,7 +34,12 @@ DEMO_STORIES = [
         "benefit": "generar HU a partir de lo conversado",
         "acceptance_criteria": "- [ ] Acepta archivos TXT y DOCX\n- [ ] Muestra vista previa del texto",
         "type": "HU_TRADICIONAL", "type_justification": "Carga de archivos sin componentes de IA",
-        "estimate_points": 3, "priority_rank": 1, "source_ref": "Reunión 2026-09-12, min 4:10",
+        "priority_rank": 1, "source_ref": "Reunión 2026-09-12, min 4:10",
+        "fp_components": [
+            {"name": "Transcripción", "type": "ILF", "det": 6, "ret": 1},
+            {"name": "Subir transcripción", "type": "EI", "det": 5, "ftr": 1},
+            {"name": "Vista previa del texto", "type": "EQ", "det": 3, "ftr": 1},
+        ],
     }),
     ("Gestión de backlog", {
         "title": "Generar HU desde transcripción",
@@ -42,7 +47,12 @@ DEMO_STORIES = [
         "benefit": "reducir tiempo de redacción",
         "acceptance_criteria": "- [ ] Cada HU incluye fuente\n- [ ] Formato rol/necesidad/beneficio",
         "type": "HU_IA", "type_justification": "Requiere LLM para extracción de requisitos",
-        "estimate_points": 8, "priority_rank": 2, "source_ref": "Reunión 2026-09-12, min 4:10",
+        "priority_rank": 2, "source_ref": "Reunión 2026-09-12, min 4:10",
+        "fp_components": [
+            {"name": "Historia de usuario", "type": "ILF", "det": 12, "ret": 1},
+            {"name": "Servicio LLM", "type": "EIF", "det": 4, "ret": 1},
+            {"name": "Generar HU desde transcripción", "type": "EI", "det": 6, "ftr": 3},
+        ],
     }),
     ("Clasificación", {
         "title": "Clasificar HU como IA o tradicional",
@@ -50,7 +60,13 @@ DEMO_STORIES = [
         "benefit": "estimar cada tipo con su método",
         "acceptance_criteria": "- [ ] Cada HU tiene etiqueta y justificación",
         "type": "HU_IA", "type_justification": "Clasificación asistida por LLM",
-        "estimate_points": 5, "priority_rank": 3,
+        "priority_rank": 3,
+        # Historia de usuario y Servicio LLM ya los contó la HU anterior: suman 0 (reused).
+        "fp_components": [
+            {"name": "Historia de usuario", "type": "ILF", "det": 12, "ret": 1, "reused": True},
+            {"name": "Servicio LLM", "type": "EIF", "det": 4, "ret": 1, "reused": True},
+            {"name": "Clasificar HU", "type": "EI", "det": 4, "ftr": 2},
+        ],
     }),
 ]
 

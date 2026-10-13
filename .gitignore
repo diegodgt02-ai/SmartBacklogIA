@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+# Claves de cuentas de servicio de GCP (AGENT_DOCS_SOURCE=gcs) y cookies de los ejemplos con curl
+secrets/
+cookies.txt
 *.db
 # Archivos de Claude (no se suben: configuración e instrucciones del asistente)
 .claude/

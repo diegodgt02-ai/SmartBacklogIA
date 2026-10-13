@@ -47,12 +47,14 @@
     {% for r in runs %}
       <tr>
         <td class="code">{{ r.id }}</td>
-        <td>{{ {'generate_stories': 'Generar HU', 'generate_from_docs': 'Generar HU (documentos)', 'refine_story': 'Refinar HU', 'estimate_story': 'Estimar HU'}.get(r.kind, r.kind) }}</td>
+        <td>{{ {'generate_stories': 'Generar HU', 'generate_from_docs': 'Generar HU (documentos)', 'refine_story': 'Refinar HU', 'size_story': 'Estimar HU', 'size_backlog': 'Estimar backlog', 'extract_context': 'Extraer grafo de contexto'}.get(r.kind, r.kind) }}</td>
         <td><span class="badge {{ 'ok' if r.status == 'succeeded' else ('pending' if r.status in ('queued','running') else 'none') }}">{{ r.status }}</span></td>
         <td class="small">{{ r.input_ref or '—' }}</td>
         <td class="small">
           {% if r.status == 'failed' %}<span style="color:var(--danger)">{{ r.error }}</span>
           {% elif r.result and r.kind in ('generate_stories', 'generate_from_docs') %}creadas {{ r.result.created|length }} · actualizadas {{ r.result.updated|length }}{% if r.result.documents_read %} · leídos {{ r.result.documents_read|join(', ') }}{% endif %}
+          {% elif r.result and r.kind == 'extract_context' %}borrador v{{ r.result.version }} · {{ r.result.summary.feature }} funcionalidades, {{ r.result.summary.entity }} entidades, {{ r.result.summary.constraint }} restricciones
+          {% elif r.result and r.kind in ('size_story', 'size_backlog') %}{{ r.result.sized|length }} HU · {{ '%g'|format(r.result.function_points) }} FP
           {% elif r.result %}{{ r.result.story }} · {{ r.result.notes or '' }}
           {% else %}—{% endif %}
         </td>

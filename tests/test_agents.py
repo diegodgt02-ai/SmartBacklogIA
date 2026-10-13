@@ -323,3 +323,118 @@ def test_web_generate_from_documents_form(demo, agents):
     page = demo.get("/p/DEMO/agents").text
     assert "Generar HU (documentos)" in page and "leídos reunion.md" in page
     assert demo.get("/api/v1/projects/DEMO/stories/DEMO-3").json()["title"] == "Validar tarjeta del cliente"
+
+
+# ---------- dimensionamiento con puntos de función (etapa 3, HITL) ----------
+
+def size(client, code, **body):
+    return client.post(f"/api/v1/projects/DEMO/stories/{code}/agents/size", json=body)
+
+
+def size_backlog(client, **body):
+    return client.post("/api/v1/projects/DEMO/agents/size-backlog", json=body)
+
+
+def test_size_story_with_agent_records_analysis_and_history(demo, agents):
+    login(demo, "po@demo.co")
+    res = size(demo, "DEMO-1")
+    assert res.status_code == 202, res.text
+    run = res.json()
+    assert run["status"] == "succeeded" and run["kind"] == "size_story"
+    assert run["result"]["story"] == "DEMO-1" and run["result"]["points"] == 10  # ILF baja 7 + EQ baja 3
+
+    story = demo.get("/api/v1/projects/DEMO/stories/DEMO-1").json()
+    assert story["function_points"] == 10 and story["status"] == "borrador"  # no cambia el estado
+    analysis = story["fp_analysis"]
+    assert [f["type"] for f in analysis["functions"]] == ["ILF", "EQ"]
+    assert analysis["notes"]["sized_by"] == "agent:stub" and analysis["notes"]["concepts"]
+    kinds = [e["event_type"] for e in demo.get("/api/v1/projects/DEMO/stories/DEMO-1/events").json()]
+    assert "sizing_rationale" in kinds
+
+
+def test_size_backlog_in_order_reuses_registered_entities(demo, agents):
+    login(demo, "po@demo.co")
+    # Misma épica en las dos HU → la segunda reusa la ILF.
+    demo.patch("/api/v1/projects/DEMO/stories/DEMO-2", json={"epic": "Autenticación", "priority_rank": 2})
+    demo.patch("/api/v1/projects/DEMO/stories/DEMO-1", json={"priority_rank": 1})
+    run = size_backlog(demo).json()
+    assert run["status"] == "succeeded", run
+    assert [r["story"] for r in run["result"]["sized"]] == ["DEMO-1", "DEMO-2"]
+    assert run["result"]["registry"] == ["Autenticación"]
+    second = demo.get("/api/v1/projects/DEMO/stories/DEMO-2").json()["fp_analysis"]
+    ilf = next(f for f in second["functions"] if f["type"] == "ILF")
+    assert ilf["reused"] is True and ilf["fp"] == 0
+    assert second["notes"]["registry"] == ["Autenticación"]
+
+    assert size_backlog(demo).status_code == 422  # todo dimensionado
+    again = size_backlog(demo, resize=True).json()
+    assert len(again["result"]["sized"]) == 2
+
+
+def test_server_marks_registered_entities_as_reused_even_if_the_model_does_not(demo, agents, monkeypatch):
+    from app.agents.ports import SizingOutput, Usage
+
+    def careless(self, data):
+        # El modelo olvida marcar reused y escribe el nombre con otra capitalización.
+        return SizingOutput(functions=[{"name": "AUTENTICACIÓN ", "type": "ILF", "det": 8, "ret": 1}]), Usage()
+
+    login(demo, "po@demo.co")
+    demo.patch("/api/v1/projects/DEMO/stories/DEMO-1", json={"priority_rank": 1, "fp_components": [
+        {"name": "Autenticación", "type": "ILF", "det": 8, "ret": 1}]})
+    demo.patch("/api/v1/projects/DEMO/stories/DEMO-2", json={"priority_rank": 2})
+    monkeypatch.setattr(StubProvider, "size_story", careless)
+    assert size(demo, "DEMO-2").json()["status"] == "succeeded"
+    second = demo.get("/api/v1/projects/DEMO/stories/DEMO-2").json()
+    assert second["fp_analysis"]["functions"][0]["reused"] is True and second["function_points"] == 0
+
+
+def test_sizing_rules_permissions_and_failures(demo, agents, monkeypatch):
+    for user in ("dev@demo.co", "stake@demo.co"):
+        login(demo, user)
+        assert size(demo, "DEMO-1").status_code == 403
+        assert size_backlog(demo).status_code == 403
+    login(demo, "po@demo.co")
+    monkeypatch.setattr(settings, "agent_provider", "none")
+    assert size(demo, "DEMO-1").status_code == 503
+    monkeypatch.setattr(settings, "agent_provider", "stub")
+
+    calls, original = [], StubProvider.size_story
+
+    def flaky(self, data):
+        calls.append(data.story["code"])
+        if len(calls) == 2:
+            raise RuntimeError("fallo simulado")
+        return original(self, data)
+
+    monkeypatch.setattr(StubProvider, "size_story", flaky)
+    run = size_backlog(demo).json()
+    assert run["status"] == "failed" and "fallo simulado" in run["error"]
+    # Una sola transacción: la primera HU tampoco quedó dimensionada.
+    assert all(s["function_points"] is None for s in demo.get("/api/v1/projects/DEMO/stories").json())
+
+
+def test_agent_never_approves_stage_3_and_humans_still_do(demo, agents, service_key):
+    login(demo, "po@demo.co")
+    size_backlog(demo)
+    stages = {s["stage_number"]: s for s in demo.get("/api/v1/projects/DEMO/pipeline").json()}
+    assert stages[3]["status"] == "pending" and stages[3]["name"] == "Estimación"
+    assert demo.post("/api/v1/projects/DEMO/pipeline/3/approve", headers={"X-API-Key": service_key}).status_code == 422
+    for n in (1, 2, 3):
+        assert demo.post(f"/api/v1/projects/DEMO/pipeline/{n}/approve", json={"summary": "revisado"}).status_code == 200
+
+
+def test_web_size_buttons(demo, agents):
+    web_login(demo, "po@demo.co")
+    page = demo.get("/p/DEMO/stories/DEMO-1").text
+    assert "Medir con agente (puntos de función)" in page
+    res = demo.post("/p/DEMO/stories/DEMO-1/agents/size", follow_redirects=False)
+    assert res.status_code == 303
+    page = demo.get("/p/DEMO/stories/DEMO-1").text
+    assert "Total (UFP)" in page and "fpa_ifpug_ufp_v1" in page
+
+    assert "Dimensionar HU pendientes con agente" in demo.get("/p/DEMO/reports").text
+    res = demo.post("/p/DEMO/agents/size-backlog", data={}, follow_redirects=False)
+    assert res.status_code == 303
+    assert demo.get("/api/v1/projects/DEMO/stories/DEMO-2").json()["function_points"] is not None
+    agents_page = demo.get("/p/DEMO/agents").text
+    assert "Estimar HU" in agents_page and "Estimar backlog" in agents_page

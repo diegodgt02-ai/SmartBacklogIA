@@ -41,11 +41,74 @@
       </form>
     </details>
     {% endif %}
-    {% if can_edit and story.type and story.status not in ('descartada', 'hecha') %}
-    <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/agents/estimate" style="margin-top:10px">
-      <button class="btn" type="submit" {{ 'disabled' if not agent_status.configured }}>Estimar con agente ({{ type_labels[story.type] }})</button>
-      <span class="small muted">{% if agent_status.configured %}El agente puntúa los factores del método; el sistema calcula los puntos.{% else %}Agente no configurado: {{ agent_status.reason }}{% endif %}</span>
+    {% if can_edit and story.status != 'descartada' %}
+    <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/agents/size" style="margin-top:10px">
+      <button class="btn" type="submit" {{ 'disabled' if not agent_status.configured }}>Medir con agente (puntos de función)</button>
+      <span class="small muted">{% if agent_status.configured %}Los agentes identifican y clasifican las funciones IFPUG; el sistema calcula los puntos. Un humano revisa y aprueba la etapa 3.{% else %}Agente no configurado: {{ agent_status.reason }}{% endif %}</span>
     </form>
+    {% endif %}
+
+    {% set ca = story.context_analysis %}
+    {% if ca %}
+    <section class="card">
+      <div class="card-head"><h2>Contexto y restricciones</h2><span class="spacer"></span><span class="small muted mono">grafo v{{ ca.graph_version }} · {{ ca.method }}</span></div>
+      {% if ca.summary %}<p class="small">{{ ca.summary }}</p>{% endif %}
+      {% for v in ca.violations %}
+      <div class="alert {{ 'ok' if v.status == 'waived' else 'error' }}" style="margin:10px 0">
+        <strong>{{ 'Excepción registrada' if v.status == 'waived' else 'Restricción violada' }}:</strong> {{ v.name }}
+        <span class="small">({{ v.category }} · {{ v.severity }})</span>
+        <div class="small">{{ v.reason }}</div>
+        <div class="small muted">Regla: {{ v.rule }}</div>
+        {% if v.status == 'waived' %}<div class="small">{{ v.waiver.by }}: {{ v.waiver.justification }}</div>
+        {% elif can_edit %}
+        <form method="post" action="/p/{{ project.key }}/stories/{{ story.code }}/violations/{{ v.constraint_id }}/waive" class="row" style="margin-top:8px">
+          <input name="justification" minlength="10" required placeholder="Justificación de la excepción (mín. 10 caracteres)" style="flex:1">
+          <button class="btn btn-sm" type="submit">Registrar excepción</button>
+        </form>
+        <div class="small muted">O cambia la HU y vuelve a medirla. Mientras esté abierta, la etapa 3 no se puede aprobar.</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+      <div class="table-wrap"><table>
+        <thead><tr><th>Restricción activada</th><th>Categoría</th><th>Severidad</th><th class="num">Puntos NFR</th></tr></thead>
+        <tbody>
+        {% for c in ca.constraints %}
+          <tr><td>{{ c.name }}<div class="small muted">{{ c.reason }}</div></td><td>{{ c.category }}</td><td>{{ c.severity }}</td><td class="num">{{ c.points }}</td></tr>
+        {% else %}<tr><td colspan="4" class="muted small">Ninguna restricción activada.</td></tr>{% endfor %}
+        </tbody>
+        <tfoot><tr><th colspan="3">Tamaño no funcional</th><th class="num">{{ ca.nfr_points }}</th></tr></tfoot>
+      </table></div>
+      {% if ca.impacted_features or ca.existing_entities %}
+      <p class="small muted" style="margin-top:8px">
+        {% if ca.impacted_features %}Toca: {% for f in ca.impacted_features %}{{ f.name }} ({{ f.status }}){{ ', ' if not loop.last }}{% endfor %}.{% endif %}
+        {% if ca.existing_entities %} Reusa lo existente: {% for e in ca.existing_entities %}{{ e.name }}{{ ', ' if not loop.last }}{% endfor %}.{% endif %}
+      </p>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if story.fp_analysis %}
+    <section class="card">
+      <div class="card-head"><h2>Puntos de función</h2><span class="spacer"></span><span class="small muted mono">{{ story.fp_analysis.method }}</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Función</th><th>Tipo</th><th class="num">DET</th><th class="num">RET/FTR</th><th>Complejidad</th><th class="num">FP</th></tr></thead>
+        <tbody>
+        {% for f in story.fp_analysis.functions %}
+          <tr>
+            <td>{{ f.name }}{% if f.rationale %}<div class="small muted">{{ f.rationale }}</div>{% endif %}</td>
+            <td class="mono">{{ f.type }}</td>
+            <td class="num">{{ f.det }}</td>
+            <td class="num">{{ f.ret if f.ret is defined else f.ftr }}</td>
+            <td>{{ {'low': 'Baja', 'average': 'Media', 'high': 'Alta'}[f.complexity] }}</td>
+            <td class="num">{% if f.reused %}<span class="small muted" title="Ya contada por una HU anterior">reusada · 0</span>{% else %}{{ f.fp }}{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+        <tfoot><tr><th colspan="5">Total (UFP)</th><th class="num">{{ story.fp_analysis.ufp }}</th></tr></tfoot>
+      </table></div>
+      {% if story.fp_analysis.notes and story.fp_analysis.notes.rationale %}<p class="small muted" style="margin-top:10px">{{ story.fp_analysis.notes.rationale }}{% if story.fp_analysis.notes.sized_by %} · {{ story.fp_analysis.notes.sized_by }}{% endif %}</p>{% endif %}
+      <p class="small muted" style="margin-top:6px">Para corregir: <span class="mono">PATCH /api/v1/projects/{{ project.key }}/stories/{{ story.code }}</span> con <span class="mono">fp_components</span>; el sistema recalcula y deja el cambio en el historial.</p>
+    </section>
     {% endif %}
 
     {% if can_edit %}
@@ -64,18 +127,6 @@
         <div class="field span-2"><label for="e-benefit">Beneficio</label><input id="e-benefit" name="benefit" value="{{ story.benefit or '' }}"></div>
         <div class="field span-2"><label for="e-criteria">Criterios de aceptación (markdown)</label><textarea id="e-criteria" name="criteria" rows="8">{{ story.acceptance_criteria or '' }}</textarea></div>
         <div class="field span-2"><label for="e-just">Justificación del tipo</label><input id="e-just" name="type_justification" value="{{ story.type_justification or '' }}"></div>
-        <fieldset class="span-2" style="border:1px solid var(--line,#ddd);border-radius:8px;padding:12px">
-          <legend class="small"><strong>Factores de estimación</strong> · se usan los del tipo de la HU; si los completas, el sistema calcula puntos, rango y spike</legend>
-          {% set cur = (story.estimate_factors or {}).get('factors', {}) %}
-          <div class="form-grid">
-          {% for name, label, group in [('datos','Datos (HU-IA)','ia'),('modelo','Modelo o prompt (HU-IA)','ia'),('evaluacion','Evaluación (HU-IA)','ia'),('riesgo','Riesgo (HU-IA)','ia'),('integracion','Integración (HU-IA)','ia'),('complejidad','Complejidad (HU-Trad.)','trad'),('esfuerzo','Esfuerzo (HU-Trad.)','trad'),('incertidumbre','Incertidumbre (HU-Trad.)','trad')] %}
-            <div class="field"><label for="e-f-{{ name }}">{{ label }}</label>
-              <select id="e-f-{{ name }}" name="f_{{ name }}" data-group="{{ group }}"><option value="">—</option>{% for v in range(1,6) %}<option value="{{ v }}" {{ 'selected' if cur.get(name) == v }}>{{ v }}</option>{% endfor %}</select></div>
-          {% endfor %}
-          </div>
-        </fieldset>
-        <div class="field"><label for="e-points">Estimación (pts)</label><input id="e-points" name="estimate_points" inputmode="decimal" value="{{ story.estimate_points if story.estimate_points is not none else '' }}"></div>
-        <div class="field"><label for="e-method">Método de estimación</label><input id="e-method" name="estimate_method" value="{{ story.estimate_method or '' }}"></div>
         <div class="field"><label for="e-rank">Prioridad (ranking)</label><input id="e-rank" name="priority_rank" inputmode="numeric" value="{{ story.priority_rank if story.priority_rank is not none else '' }}"></div>
         <div class="field"><label for="e-pmethod">Método de priorización</label><input id="e-pmethod" name="priority_method" value="{{ story.priority_method or '' }}"></div>
         <div class="field span-2"><label for="e-src">Fuente (trazabilidad)</label><input id="e-src" name="source_ref" value="{{ story.source_ref or '' }}"></div>
@@ -91,7 +142,7 @@
         <span class="dot {{ 'auto' if e.actor_type == 'service' }}"></span>
         <div>
           <div><strong>{{ e.actor_name }}</strong>
-            <span class="muted">{{ {'created':'creó la HU','updated':'editó','status_changed':'cambió estado','refined':'refinó','refinement_notes':'notas de refinamiento','assigned':'reasignó','estimation_rationale':'justificó la estimación'}[e.event_type] or e.event_type }}</span>
+            <span class="muted">{{ {'created':'creó la HU','updated':'editó','status_changed':'cambió estado','refined':'refinó','refinement_notes':'notas de refinamiento','assigned':'reasignó','sizing_rationale':'justificó el dimensionamiento','constraint_violations':'detectó restricciones violadas','violation_waived':'exceptuó una restricción'}[e.event_type] or e.event_type }}</span>
             {% if e.from_status and e.to_status %}
               <span class="small">{{ status_labels[e.from_status] }} → {{ status_labels[e.to_status] }}</span>
             {% endif %}
@@ -129,11 +180,10 @@
     <section class="card">
       <h2 style="margin-bottom:12px">Detalles</h2>
       <dl style="display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0">
-        <dt class="muted">Estimación</dt><dd style="margin:0">{{ m.points(story.estimate_points) }} <span class="small muted">{{ story.estimate_method or '' }}</span></dd>
-        {% if story.estimate_factors and story.estimate_factors.range %}
-        <dt class="muted">Rango</dt><dd style="margin:0">{{ story.estimate_factors.range.min }}–{{ story.estimate_factors.range.max }} pts</dd>
-        <dt class="muted">Spike</dt><dd style="margin:0">{% if story.estimate_factors.spike.required %}Requerido · {{ story.estimate_factors.spike.points }} pts de experimentación{% else %}No requerido{% endif %}</dd>
-        <dt class="muted">Factores</dt><dd style="margin:0" class="small mono">{% for k, v in story.estimate_factors.factors.items() %}{{ k }}={{ v }}{{ ' · ' if not loop.last }}{% endfor %}</dd>
+        <dt class="muted">No funcional</dt><dd style="margin:0">{{ '%g NFR'|format(story.nfr_points) if story.nfr_points is not none else '—' }}</dd>
+        <dt class="muted">Tamaño</dt><dd style="margin:0">{{ m.fp(story.function_points) }}{% if story.fp_analysis %} <span class="small muted">{{ story.fp_analysis.method }}</span>{% endif %}</dd>
+        {% if story.fp_analysis %}
+        <dt class="muted">Por tipo</dt><dd style="margin:0" class="small mono">{% for k, v in story.fp_analysis.by_type.items() if v %}{{ k }}={{ v }}{{ ' · ' if not loop.last }}{% else %}—{% endfor %}</dd>
         {% endif %}
         <dt class="muted">Prioridad</dt><dd style="margin:0">{{ '#' ~ story.priority_rank if story.priority_rank is not none else '—' }}</dd>
         <dt class="muted">Asignado</dt><dd style="margin:0">{{ story.assignee.name if story.assignee else 'Sin asignar' }}</dd>

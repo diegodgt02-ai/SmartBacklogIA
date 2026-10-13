@@ -10,8 +10,8 @@
   {% endif %}
 {%- endmacro %}
 
-{% macro points(p) -%}
-  {% if p is not none %}<span class="mono">{{ '%g'|format(p) }} pts</span>{% else %}<span class="muted">—</span>{% endif %}
+{% macro fp(p) -%}
+  {% if p is not none %}<span class="mono" title="Puntos de función IFPUG sin ajustar">{{ '%g'|format(p) }} FP</span>{% else %}<span class="muted" title="Sin dimensionar">—</span>{% endif %}
 {%- endmacro %}
 
 {% macro initials(name) -%}

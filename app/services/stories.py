@@ -1,9 +1,9 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Epic, Project, RefinementRequest, UserStory
-from app.services import audit, estimation
-from app.services.errors import NotFound, Unprocessable
+from app.models import Epic, Project, RefinementRequest, UserStory, utcnow
+from app.services import audit, fpa, nfr
+from app.services.errors import Forbidden, NotFound, Unprocessable
 from app.services.workflow import Actor, check_transition
 
 EDITABLE_FIELDS = (
@@ -14,9 +14,10 @@ EDITABLE_FIELDS = (
     "acceptance_criteria",
     "type",
     "type_justification",
-    "estimate_points",
-    "estimate_method",
-    "estimate_factors",
+    "function_points",
+    "fp_analysis",
+    "nfr_points",
+    "context_analysis",
     "priority_rank",
     "priority_method",
     "source_ref",
@@ -57,18 +58,16 @@ def snapshot(story: UserStory) -> dict:
         "acceptance_criteria": story.acceptance_criteria,
         "type": story.type,
         "type_justification": story.type_justification,
-        "estimate_points": story.estimate_points,
-        "estimate_method": story.estimate_method,
-        "estimate_factors": story.estimate_factors,
+        "function_points": story.function_points,
         "version": story.version,
     }
 
 
-def _with_estimate(data: dict, story_type: str | None) -> dict:
-    """Si llegan factores de estimación, calcula puntos y método en el servidor (ver services/estimation.py)."""
+def _with_fpa(data: dict) -> dict:
+    """Si llegan componentes de puntos de función, el servidor calcula el tamaño (ver services/fpa.py)."""
     try:
-        return estimation.apply_to_story_data(story_type, dict(data))
-    except estimation.EstimationError as exc:
+        return fpa.apply_to_story_data(dict(data))
+    except fpa.FpaError as exc:
         raise Unprocessable(str(exc)) from exc
 
 
@@ -95,7 +94,7 @@ def apply_changes(
     bump_version: bool = True,
 ) -> dict:
     """Aplica cambios editables y registra el diff. `epic` (título) es None para quitar la épica."""
-    data = _with_estimate(data, data.get("type", story.type))
+    data = _with_fpa(data)
     if "epic" in data:
         title = data.pop("epic")
         data["epic_id"] = get_or_create_epic(db, project, title).id if title else None
@@ -118,7 +117,7 @@ def create_story(
     actor: Actor,
     external_id: str | None = None,
 ) -> UserStory:
-    data = _with_estimate(data, data.get("type"))
+    data = _with_fpa(data)
     epic_title = data.pop("epic", None)
     _resolve_assignee(project, data)
     story = UserStory(
@@ -217,3 +216,40 @@ def list_stories(
         stmt = stmt.where(UserStory.assignee_id == assignee_id)
     stmt = stmt.order_by(UserStory.priority_rank.is_(None), UserStory.priority_rank, UserStory.id)
     return list(db.scalars(stmt))
+
+
+def waive_violation(db: Session, story: UserStory, constraint_id: str, actor: Actor, justification: str) -> dict:
+    """Excepción humana (HITL) a una restricción violada. Queda en el análisis y en el historial.
+
+    La otra forma de cerrar una violación es cambiar la HU y volver a dimensionarla.
+    """
+    if actor.is_service:
+        raise Forbidden("Solo una persona puede exceptuar una restricción violada")
+    justification = (justification or "").strip()
+    if len(justification) < 10:
+        raise Unprocessable("La justificación debe tener al menos 10 caracteres")
+    analysis = story.context_analysis or {}
+    violation = next((v for v in analysis.get("violations", []) if v["constraint_id"] == constraint_id), None)
+    if violation is None:
+        raise NotFound(f"La HU {story.code} no tiene una violación de {constraint_id}")
+    if violation["status"] != "open":
+        raise Unprocessable(f"La violación de {constraint_id} ya está {violation['status']}")
+    waiver = {"by": actor.name, "at": utcnow().isoformat(), "justification": justification[:1000]}
+    violations = [
+        {**v, "status": "waived", "waiver": waiver} if v["constraint_id"] == constraint_id else v
+        for v in analysis["violations"]
+    ]
+    story.context_analysis = {**analysis, "violations": violations}
+    story.version += 1
+    audit.record(db, story, actor, "violation_waived", diff={"constraint_id": constraint_id, **waiver})
+    return next(v for v in violations if v["constraint_id"] == constraint_id)
+
+
+def open_violations(project: Project) -> list[dict]:
+    """Violaciones abiertas de las HU activas: bloquean la aprobación de la etapa 3."""
+    return [
+        {"story": s.code, "constraint_id": v["constraint_id"], "name": v["name"], "severity": v["severity"],
+         "reason": v["reason"]}
+        for s in sorted(project.stories, key=lambda s: s.id) if s.status != "descartada"
+        for v in nfr.open_violations(s.context_analysis)
+    ]

@@ -148,11 +148,13 @@ def test_hitl_pipeline_requires_previous_approval(client, service_key):
 def test_reports_and_export(client, service_key):
     ingest(client, service_key)
     login(client, "po@demo.co")
-    client.patch("/api/v1/projects/DEMO/stories/DEMO-1", json={"estimate_points": 5, "priority_rank": 1})
+    client.patch("/api/v1/projects/DEMO/stories/DEMO-1", json={
+        "fp_components": [{"name": "Usuario", "type": "ILF", "det": 5, "ret": 1}], "priority_rank": 1,
+    })
 
     summary = client.get("/api/v1/projects/DEMO/reports/summary").json()
     assert summary["total_stories"] == 2
-    assert summary["total_points"] == 5
+    assert summary["total_function_points"] == 7 and summary["unsized_stories"] == 1
     assert summary["by_status"]["borrador"]["count"] == 2
 
     csv = client.get("/api/v1/projects/DEMO/export?format=csv")

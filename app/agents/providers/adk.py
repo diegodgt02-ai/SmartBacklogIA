@@ -22,29 +22,34 @@ from pydantic import BaseModel, Field
 
 from app.agents.ports import (
     AgentNotConfigured,
+    ContextExtractionInput,
+    ContextGraphOutput,
+    ContextReport,
     DocumentGenerationInput,
-    EstimationInput,
-    EstimationOutput,
     GenerationInput,
     GenerationOutput,
     RefinementInput,
     RefinementOutput,
+    SizingInput,
+    SizingOutput,
     Usage,
 )
 from app.agents.prompts import (
+    CONTEXT_ENRICHER_INSTRUCTION,
+    CONTEXT_EXTRACTOR_INSTRUCTION,
     DOCUMENT_AGENT_INSTRUCTION,
-    ESTIMATOR_INSTRUCTION,
+    FPA_ACT_INSTRUCTION,
+    FPA_CONCEPT_INSTRUCTION,
     GENERATOR_FROM_DOCS_INSTRUCTION,
     GENERATOR_INSTRUCTION,
     REFINER_INSTRUCTION,
 )
+from app.services import context_graph
 
 
 # Esquemas que ve el modelo. Gemini rechaza restricciones como minLength/maxLength/maxItems
 # (400 INVALID_ARGUMENT), así que aquí van sin longitudes. Las reglas de negocio se aplican
 # después, validando la respuesta con los DTO estrictos de ports.py.
-IA_FACTORS = ("datos", "modelo", "evaluacion", "riesgo", "integracion")
-TRADITIONAL_FACTORS = ("complejidad", "esfuerzo", "incertidumbre")
 
 
 class _LlmStory(BaseModel):
@@ -73,17 +78,72 @@ class _LlmRefinementOutput(BaseModel):
     notes: str | None = Field(None, description="Qué se cambió y por qué, en una o dos frases")
 
 
-class _LlmEstimationOutput(BaseModel):
-    # Un campo por factor (Gemini no admite dict libre). Solo se usan los del tipo de la HU.
-    datos: int | None = Field(None, description="Factor HU-IA: disponibilidad y calidad de datos, 1–5")
-    modelo: int | None = Field(None, description="Factor HU-IA: complejidad del modelo o prompt, 1–5")
-    evaluacion: int | None = Field(None, description="Factor HU-IA: necesidad de evaluación, 1–5")
-    riesgo: int | None = Field(None, description="Factor HU-IA y HU-Tradicional: riesgo o incertidumbre de resultado, 1–5")
-    integracion: int | None = Field(None, description="Factor HU-IA: trabajo tradicional alrededor, 1–5")
-    complejidad: int | None = Field(None, description="Factor HU-Tradicional: complejidad de reglas y flujos, 1–5")
-    esfuerzo: int | None = Field(None, description="Factor HU-Tradicional: esfuerzo de construcción e integración, 1–5")
-    incertidumbre: int | None = Field(None, description="Factor HU-Tradicional: claridad del requisito, 1–5")
-    rationale: str | None = Field(None, description="Justificación en una o dos frases")
+class _LlmConcept(BaseModel):
+    name: str = Field(description="Nombre de la entidad o transacción")
+    kind: Literal["entidad", "transaccion"] = Field(description="entidad o transaccion")
+    evidence: str | None = Field(None, description="Frase de la HU que lo respalda")
+
+
+class _LlmConcepts(BaseModel):
+    concepts: list[_LlmConcept] = Field(default_factory=list, description="Conceptos de la HU")
+
+
+class _LlmFunction(BaseModel):
+    name: str = Field(description="Nombre de la función")
+    type: Literal["ILF", "EIF", "EI", "EO", "EQ"] = Field(description="Tipo IFPUG")
+    det: int = Field(description="Campos reconocibles por el usuario")
+    ret: int | None = Field(None, description="Solo ILF/EIF: subgrupos de datos")
+    ftr: int | None = Field(None, description="Solo EI/EO/EQ: archivos leídos o mantenidos")
+    reused: bool = Field(False, description="true si la ILF/EIF ya está en el registro del proyecto")
+    rationale: str | None = Field(None, description="Por qué este tipo y estos conteos, en una frase")
+
+
+class _LlmFunctions(BaseModel):
+    functions: list[_LlmFunction] = Field(default_factory=list, description="Funciones IFPUG de la HU")
+    rationale: str | None = Field(None, description="Decisiones dudosas, en una o dos frases")
+
+
+class _LlmGraphNode(BaseModel):
+    id: str = Field(description="id estable: minúsculas, dígitos y guiones")
+    kind: Literal["feature", "entity", "constraint"] = Field(description="Tipo de nodo")
+    name: str = Field(description="Nombre")
+    description: str | None = None
+    status: Literal["existente", "planificado"] | None = Field(None, description="Solo feature y entity")
+    category: str | None = Field(None, description="Solo constraint: seguridad, privacidad, rendimiento, ...")
+    severity: Literal["baja", "media", "alta", "critica"] | None = Field(None, description="Solo constraint")
+    rule: str | None = Field(None, description="Solo constraint: regla verificable")
+    keywords: list[str] = Field(default_factory=list, description="Solo constraint: palabras que la delatan")
+    source: str | None = Field(None, description="Documento y sección de donde sale")
+
+
+class _LlmGraphEdge(BaseModel):
+    source: str = Field(description="id del nodo origen")
+    target: str = Field(description="id del nodo destino")
+    type: Literal["depends_on", "uses", "applies_to"]
+
+
+class _LlmGraph(BaseModel):
+    nodes: list[_LlmGraphNode] = Field(default_factory=list)
+    edges: list[_LlmGraphEdge] = Field(default_factory=list)
+    notes: str | None = Field(None, description="Suposiciones y dudas")
+
+
+class _LlmFeatureHit(BaseModel):
+    node_id: str
+    how: str | None = None
+
+
+class _LlmConstraintHit(BaseModel):
+    constraint_id: str
+    reason: str | None = None
+
+
+class _LlmContextReport(BaseModel):
+    impacted_features: list[_LlmFeatureHit] = Field(default_factory=list)
+    existing_entities: list[str] = Field(default_factory=list, description="ids existentes que la HU reusa")
+    triggered_constraints: list[_LlmConstraintHit] = Field(default_factory=list)
+    violations: list[_LlmConstraintHit] = Field(default_factory=list)
+    summary: str | None = None
 
 
 class AdkProvider:
@@ -92,7 +152,7 @@ class AdkProvider:
     def __init__(self, model: str, api_key: str | None, llm=None):
         """`llm` permite inyectar un BaseLlm (pruebas sin red). En producción se usa el nombre de Gemini."""
         try:
-            from google.adk.agents import LlmAgent
+            from google.adk.agents import LlmAgent, SequentialAgent
             from google.adk.apps import App
             from google.adk.plugins.base_plugin import BasePlugin
             from google.adk.runners import Runner
@@ -109,6 +169,7 @@ class AdkProvider:
         self._model_ref = llm if llm is not None else model
         self.model = model if isinstance(model, str) else getattr(model, "model", None)
         self._LlmAgent = LlmAgent
+        self._SequentialAgent = SequentialAgent
         self._App = App
         self._BasePlugin = BasePlugin
         self._AgentTool = AgentTool
@@ -143,6 +204,13 @@ class AdkProvider:
             output_schema=llm_schema,
             tools=tools or [],
         )
+        final_text, _state, usage = self._execute(agent, user_text)
+        # Validación estricta del lado del backend (longitudes, enums, límites).
+        return schema.model_validate_json(final_text), usage
+
+    def _execute(self, agent, user_text: str) -> tuple[str, dict, Usage]:
+        """Ejecuta un agente (simple o compuesto) en una sesión efímera. Devuelve la última respuesta final,
+        el estado de la sesión (output_key de los subagentes) y el uso de tokens de todas las llamadas."""
         usage = Usage(model=self.model)
         sessions = self._sessions_cls()
         app = self._App(name="spb", root_agent=agent, plugins=[self._usage_plugin(usage)])
@@ -160,8 +228,10 @@ class AdkProvider:
                     final_text = "".join(part.text or "" for part in event.content.parts)
             if not final_text:
                 raise RuntimeError("El modelo no devolvió una respuesta final")
-            # Validación estricta del lado del backend (longitudes, enums, límites).
-            return schema.model_validate_json(final_text), usage
+            session = sessions.get_session(app_name="spb", user_id="spb", session_id=session_id)
+            if inspect.isawaitable(session):
+                session = await session
+            return final_text, dict(session.state) if session else {}, usage
 
         return asyncio.run(_run())
 
@@ -209,19 +279,72 @@ class AdkProvider:
         )
         return self._call(REFINER_INSTRUCTION, _LlmRefinementOutput, RefinementOutput, user_text)
 
-    def estimate_story(self, data: EstimationInput) -> tuple[EstimationOutput, Usage]:
+    def size_story(self, data: SizingInput) -> tuple[SizingOutput, Usage]:
+        """Puntos de función en dos pasos (ConceptAct): conceptos → clasificación y conteos.
+
+        SequentialAgent con dos LlmAgent: el primero guarda sus conceptos en el estado (`fpa_concepts`) y el
+        segundo los recibe en su instrucción. Ninguno calcula puntos: lo hace services/fpa.py.
+        """
         story = data.story
+        registry = ", ".join(data.registry) if data.registry else "(vacío: ninguna HU anterior contó entidades)"
         user_text = (
-            f"HU {story.get('code')} (tipo: {story.get('type') or 'sin tipo'})\n"
+            f"HU {story.get('code')} (épica: {story.get('epic') or 'sin épica'}, tipo: {story.get('type') or 'sin tipo'})\n"
             f"Título: {story.get('title')}\n"
             f"Rol: {story.get('role') or ''}\n"
             f"Necesidad: {story.get('need') or ''}\n"
             f"Beneficio: {story.get('benefit') or ''}\n"
             f"Criterios (markdown):\n<criterios>\n{story.get('acceptance_criteria') or ''}\n</criterios>\n"
+            f"Registro de entidades ya contadas en el proyecto (ILF/EIF): {registry}\n"
             + (f"Instrucciones adicionales: {data.instructions}\n" if data.instructions else "")
         )
-        llm_out, usage = self._call(ESTIMATOR_INSTRUCTION, _LlmEstimationOutput, _LlmEstimationOutput, user_text)
-        # Solo pasan los factores del tipo de la HU; los demás se descartan aquí.
-        keys = IA_FACTORS if story.get("type") == "HU_IA" else TRADITIONAL_FACTORS
-        factors = {k: getattr(llm_out, k) for k in keys if getattr(llm_out, k) is not None}
-        return EstimationOutput(factors=factors, rationale=llm_out.rationale), usage
+        steps = []
+        if data.context_graph:
+            # Paso 0: el arquitecto contrasta la HU con el grafo aprobado (funcionalidades, entidades, restricciones).
+            user_text += (
+                f"\n<grafo_de_contexto version=\"{data.context_graph.get('version')}\">\n"
+                f"{context_graph.render(data.context_graph)}\n</grafo_de_contexto>\n"
+            )
+            steps.append(self._LlmAgent(
+                name="context_enricher_agent", model=self._model_ref, instruction=CONTEXT_ENRICHER_INSTRUCTION,
+                output_schema=_LlmContextReport, output_key="context_report",
+            ))
+        pipeline = self._SequentialAgent(
+            name="fpa_pipeline",
+            sub_agents=[
+                *steps,
+                self._LlmAgent(
+                    name="fpa_concept_agent", model=self._model_ref, instruction=FPA_CONCEPT_INSTRUCTION,
+                    output_schema=_LlmConcepts, output_key="fpa_concepts",
+                ),
+                self._LlmAgent(
+                    name="fpa_act_agent", model=self._model_ref, instruction=FPA_ACT_INSTRUCTION,
+                    output_schema=_LlmFunctions, output_key="fpa_functions",
+                ),
+            ],
+        )
+        final_text, state, usage = self._execute(pipeline, user_text)
+        functions = _LlmFunctions.model_validate_json(final_text)
+        concepts = state.get("fpa_concepts") or {}
+        if isinstance(concepts, str):
+            concepts = _LlmConcepts.model_validate_json(concepts).model_dump()
+        report = state.get("context_report") if data.context_graph else None
+        if isinstance(report, str):
+            report = _LlmContextReport.model_validate_json(report).model_dump()
+        # Validación estricta con los DTO de ports.py (longitudes, rangos).
+        return SizingOutput(
+            concepts=concepts.get("concepts", []),
+            functions=[f.model_dump() for f in functions.functions],
+            rationale=functions.rationale,
+            context=ContextReport.model_validate(report) if report else None,
+        ), usage
+
+    def extract_context(self, data: ContextExtractionInput, tools) -> tuple[ContextGraphOutput, Usage]:
+        """El arquitecto lee los documentos del proyecto con las herramientas de solo lectura y propone el grafo."""
+        user_text = (
+            f"Proyecto: {data.project_key} — {data.project_name}\n"
+            + (f"Instrucciones adicionales: {data.instructions}\n" if data.instructions else "")
+            + "Construye el grafo de contexto a partir de los documentos del proyecto."
+        )
+        return self._call(
+            CONTEXT_EXTRACTOR_INSTRUCTION, _LlmGraph, ContextGraphOutput, user_text, tools=tools.functions,
+        )
